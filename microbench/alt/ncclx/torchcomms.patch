@@ -1,0 +1,50 @@
+diff --git a/comms/ncclx/meta/commstate/FactoryCommStateX.cc b/comms/ncclx/meta/commstate/FactoryCommStateX.cc
+index 21e8623c3..15964b6a9 100644
+--- a/comms/ncclx/meta/commstate/FactoryCommStateX.cc
++++ b/comms/ncclx/meta/commstate/FactoryCommStateX.cc
+@@ -67,13 +67,22 @@ ncclResult_t initNvlFabricTopologies(
+   for (int rank = 0; rank < comm->nRanks; rank++) {
+     const auto& fabricInfo_ = allFabricInfos.at(rank);
+     NvlFabricTopology topo;
+-    if (fabricInfo_.state != NVML_GPU_FABRIC_STATE_NOT_SUPPORTED) {
++    const auto* clusterUuid =
++        reinterpret_cast<const unsigned long*>(&fabricInfo_.clusterUuid);
++    // NVML reports fabric capability even though an
++    // all-zero UUID means that no multi-node NVLink domain is assigned.
++    // NCCL's own MNNVL topology check treats that UUID as absent.  Mirror that
++    // rule here so CTran retains the correct host-local NVLink domains and
++    // routes cross-host peers through its IB backend instead of attempting an
++    // unsupported CUDA FABRIC-handle import between unrelated nodes.
++    if (fabricInfo_.state != NVML_GPU_FABRIC_STATE_NOT_SUPPORTED &&
++        (clusterUuid[0] != 0 || clusterUuid[1] != 0)) {
+       topo.supportNvlFabric = true;
+       topo.rank = rank;
+       topo.clusterId = fmt::format(
+           "{:x}.{:x}",
+-          ((unsigned long*)&fabricInfo_.clusterUuid)[0],
+-          ((unsigned long*)&fabricInfo_.clusterUuid)[1]);
++          clusterUuid[0],
++          clusterUuid[1]);
+       topo.cliqueId = fabricInfo_.cliqueId;
+     }
+     nvlFabricTopos.emplace_back(std::move(topo));
+diff --git a/comms/ncclx/v2_30/src/device/Makefile b/comms/ncclx/v2_30/src/device/Makefile
+index 09005e84f..96fec25c2 100644
+--- a/comms/ncclx/v2_30/src/device/Makefile
++++ b/comms/ncclx/v2_30/src/device/Makefile
+@@ -169,11 +169,13 @@ $(OBJDIR)/genobj/symmetric/%.d: $(OBJDIR)/gensrc/symmetric/%
+
+ # Device link: combine all device .o (incl. common.cu.o with GIN symbol) into device_glue.o
+ $(DEVGLUE_OBJ): $(LIB_OBJS)
+-	$(NVCC) $(NVCUFLAGS) -dlink $^ -o $@
++	$(file >$@.rsp,$^)
++	$(NVCC) $(NVCUFLAGS) -dlink --options-file $@.rsp -o $@
+
+ # Manifest lists device objs for src/Makefile; they get linked into libnccl.so so tests can resolve device symbols
+ $(MANIFEST): $(LIB_OBJS) $(DEVGLUE_OBJ)
+-	@echo $^ > $@
++	$(file >$@,$^)
++	@:
+
+ -include $(wildcard $(OBJDIR)/*.d)
+ -include $(wildcard $(OBJDIR)/genobj/*.d)

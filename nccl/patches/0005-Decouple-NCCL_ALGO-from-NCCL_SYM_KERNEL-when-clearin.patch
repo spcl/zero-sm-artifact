@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Siyuan Shen <siyshen@nvidia.com>
+Date: Thu, 20 Aug 2026 08:46:59 -0700
+Subject: [PATCH 5/9] Decouple NCCL_ALGO from NCCL_SYM_KERNEL when clearing
+ tuning tables
+
+Setting either NCCL_ALGO or NCCL_SYM_KERNEL cleared both the algorithm table
+and the symmetric-kernel table. Forcing a symmetric kernel for one collective
+therefore also wiped ordinary algorithm selection for every other collective.
+
+Each variable now clears only its own table.
+
+Signed-off-by: Siyuan Shen <siyshen@nvidia.com>
+---
+ src/tuning/cost_model.cc | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/src/tuning/cost_model.cc b/src/tuning/cost_model.cc
+index f50e28ef8..b01801c83 100644
+--- a/src/tuning/cost_model.cc
++++ b/src/tuning/cost_model.cc
+@@ -324,8 +324,14 @@ ncclResult_t ncclTuningCostModelInit(struct ncclComm* comm) {
+   const char* protoStr = ncclGetEnv("NCCL_PROTO");
+   const char* algoStr = ncclGetEnv("NCCL_ALGO");
+   const char* symKernelIdStr = ncclGetEnv("NCCL_SYM_KERNEL");
+-  if ((algoStr && strlen(algoStr) > 0) || (symKernelIdStr && strlen(symKernelIdStr) > 0)) {
++  // Clear only the table the user actually constrained. Clearing both whenever
++  // either variable is set makes it impossible to force a symmetric kernel
++  // while leaving ordinary algorithm selection intact, which leaves collectives
++  // outside the allowlist with no valid route at all.
++  if (algoStr && strlen(algoStr) > 0) {
+     std::fill_n(algoEnable, NCCL_NUM_FUNCTIONS * NCCL_NUM_ALGORITHMS, 0);
++  }
++  if (symKernelIdStr && strlen(symKernelIdStr) > 0) {
+     std::fill_n(symKernelIdEnable, NCCL_NUM_FUNCTIONS * ncclSymkKernelId_Count, 0);
+   }
+   if (protoStr) {

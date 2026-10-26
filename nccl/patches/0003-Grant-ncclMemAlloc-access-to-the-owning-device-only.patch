@@ -1,0 +1,120 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Siyuan Shen <siyshen@nvidia.com>
+Date: Thu, 1 Oct 2026 12:18:27 -0700
+Subject: [PATCH 3/9] Grant ncclMemAlloc access to the owning device only
+
+ncclMemAlloc mapped every newly allocated buffer into all peer GPUs with an
+eager cuMemSetAccess loop. That mapping is redundant: peer access is
+established per connection by the CUMEM branch of the P2P transport
+(ncclCuMemAllocAddr in transport/p2p.cc) and by symmetric-window
+registration (dev_runtime.cc), which import and map peers into their own
+VA ranges.
+
+On platforms with ATS (GB200, uvm_ats_mode=1) every host munmap waits for an
+ATC invalidation from each GPU that has access to the process's mappings.
+A CUDA-only reproducer measured +5-7 us per peer granted access with
+cuMemSetAccess, linear in the peer count and reversible on free; with eight
+GPUs per node that is ~40 us per munmap on the pacing thread.
+
+Grant RW access to the owning device only and drop the now unused device
+count. In p2pMap, call the legacy cudaDeviceEnablePeerAccess only when the
+CUMEM allocator is disabled; under CUMEM the per-connection cuMemSetAccess
+already grants the peer access, and the device-wide legacy grant would
+reintroduce the same cost irreversibly. Behaviour without CUMEM is
+unchanged.
+
+Signed-off-by: Siyuan Shen <siyshen@nvidia.com>
+---
+ src/allocator.cc     | 19 ++++++-------------
+ src/transport/p2p.cc | 27 ++++++++++++++-------------
+ 2 files changed, 20 insertions(+), 26 deletions(-)
+
+diff --git a/src/allocator.cc b/src/allocator.cc
+index 417dd64bc..e2122fc52 100644
+--- a/src/allocator.cc
++++ b/src/allocator.cc
+@@ -26,7 +26,6 @@ ncclResult_t ncclMemAlloc(void** ptr, size_t size) {
+   CUmemGenericAllocationHandle handle = (CUmemGenericAllocationHandle)-1;
+   int cudaDev;
+   int flag;
+-  int dcnt;
+ 
+   if (ptr == NULL || size == 0) goto fallback;
+ 
+@@ -53,7 +52,6 @@ ncclResult_t ncclMemAlloc(void** ptr, size_t size) {
+     CUCHECK(cuDeviceGetAttribute(&flag, CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WITH_CUDA_VMM_SUPPORTED, currentDev));
+     if (flag) memprop.allocFlags.gpuDirectRDMACapable = 1;
+     CUCHECK(cuMemGetAllocationGranularity(&memGran, &memprop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
+-    CUDACHECK(cudaGetDeviceCount(&dcnt));
+     ALIGN_SIZE(handleSize, memGran);
+ 
+ #if CUDART_VERSION >= 12030
+@@ -79,17 +77,12 @@ ncclResult_t ncclMemAlloc(void** ptr, size_t size) {
+     CUCHECK(cuMemAddressReserve((CUdeviceptr*)ptr, handleSize, memGran, 0, 0));
+     /* Map the virtual address range to the physical allocation */
+     CUCHECK(cuMemMap((CUdeviceptr)*ptr, handleSize, 0, handle, 0));
+-    /* Now allow RW access to the newly mapped memory */
+-    for (int i = 0; i < dcnt; ++i) {
+-      int p2p = 0;
+-      if (i == cudaDev || (CUDASUCCESS(cudaDeviceCanAccessPeer(&p2p, i, cudaDev)) && p2p)) {
+-        accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+-        accessDesc.location.id = i;
+-        accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+-        CUCHECK(cuMemSetAccess((CUdeviceptr)*ptr, handleSize, &accessDesc, 1));
+-      }
+-      if (0 == p2p && i != cudaDev) INFO(NCCL_ALLOC, "P2P not supported between GPU%d and GPU%d", cudaDev, i);
+-    }
++    /* Now allow RW access to the newly mapped memory -- owner device only.
++       Any ranks peer-mapping this memory will call cuMemSetAccess on their own. */
++    accessDesc.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
++    accessDesc.location.id = cudaDev;
++    accessDesc.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
++    CUCHECK(cuMemSetAccess((CUdeviceptr)*ptr, handleSize, &accessDesc, 1));
+     goto exit;
+   }
+ 
+diff --git a/src/transport/p2p.cc b/src/transport/p2p.cc
+index 468892057..ee1b8f31b 100644
+--- a/src/transport/p2p.cc
++++ b/src/transport/p2p.cc
+@@ -351,16 +351,20 @@ static ncclResult_t p2pMap(struct ncclComm* comm, struct ncclProxyConnector* pro
+   if (P2P_SAME_PID(myInfo, peerInfo)) {
+     if (peerInfo->cudaDev != myInfo->cudaDev) {
+       // Same PID different GPUs, enable P2P access
+-      // Legacy CUDA IPC
+-      cudaError_t err = cudaDeviceEnablePeerAccess(peerInfo->cudaDev, 0);
+-      if (err == cudaErrorPeerAccessAlreadyEnabled) {
+-        cudaGetLastError();
+-      } else if (err != cudaSuccess) {
+-        WARN("failed to peer with device %d(=%lx): %d %s", peerInfo->cudaDev, peerInfo->busId, err,
+-             cudaGetErrorString(err));
+-        return ncclInternalError;
+-      }
+-      if (ncclCuMemEnable()) {
++      if (!ncclCuMemEnable()) {
++        // Legacy CUDA IPC
++        cudaError_t err = cudaDeviceEnablePeerAccess(peerInfo->cudaDev, 0);
++        if (err == cudaErrorPeerAccessAlreadyEnabled) {
++          cudaGetLastError();
++        } else if (err != cudaSuccess) {
++          WARN("failed to peer with device %d(=%lx): %d %s", peerInfo->cudaDev, peerInfo->busId, err,
++               cudaGetErrorString(err));
++          return ncclInternalError;
++        }
++        *devMem = p2pBuff->directPtr;
++        *ipcPtr = NULL;
++      } else {
++        // CUMEM -- cuMemSetAccess will be invoked by ncclCuMemAllocAddr
+         // for intra-process ranks, we should map memHandle of the peers to increase refcount.
+         // Otherwise, if peers abort and free the buffer, the rank can suffer invalid access.
+         NCCLCHECK(ncclCuMemAllocAddr(devMem, &p2pBuff->ipcDesc.memHandle, p2pBuff->size));
+@@ -371,9 +375,6 @@ static ncclResult_t p2pMap(struct ncclComm* comm, struct ncclProxyConnector* pro
+         // Pass handle=0 since we already released the reference above; suspend shouldn't release again.
+         NCCLCHECK(ncclMemTrackImportFromPeer(comm->memManager, *devMem, p2pBuff->size, 0, ncclCuMemHandleType,
+                                              ncclMemOffload, peerInfo->rank, peerInfo->cudaDev, p2pBuff->directPtr));
+-      } else {
+-        *devMem = p2pBuff->directPtr;
+-        *ipcPtr = NULL;
+       }
+     } else {
+       *devMem = p2pBuff->directPtr;

@@ -1,0 +1,22 @@
+diff --git a/src/transport/net_ib.cc b/src/transport/net_ib.cc
+index 326f469..9512ad1 100644
+--- a/src/transport/net_ib.cc
++++ b/src/transport/net_ib.cc
+@@ -26,7 +26,7 @@
+ extern "C"
+ {
+   int mlx5dv_modify_qp_udp_sport(struct ibv_qp *qp, uint32_t udp_sport);
+-  int mlx5dv_modify_qp_lag_port(struct ibv_qp *qp, uint8_t port_num);
++  int mlx5dv_modify_qp_lag_port(struct ibv_qp *qp, uint8_t port_num) __attribute__((weak));
+ }
+ #include "ibvwrap.h"
+ #define NET_IB_CC
+@@ -1695,7 +1695,7 @@ ib_connect:
+     remDevInfo->mtu = std::min(remDevInfo->mtu, ibDev->portAttr.active_mtu);
+     NCCLCHECKGOTO(ncclIbRtrQp(qp, &commDev->base.gidInfo, remQpInfo->qpn, remDevInfo, false, remMeta.tc, remMeta.sl), ret, fail);
+     NCCLCHECKGOTO(ncclIbRtsQp(qp), ret, fail);
+-    if (ncclParamBondLoadBalance()) {
++    if (ncclParamBondLoadBalance() && mlx5dv_modify_qp_lag_port != nullptr) {
+       mlx5dv_modify_qp_lag_port(qp, channel_loop % 2 + 1);
+       channel_loop++;
+     }

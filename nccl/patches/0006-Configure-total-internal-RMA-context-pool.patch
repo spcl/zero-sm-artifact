@@ -1,0 +1,72 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Zhenhao He <zhenhaoh@nvidia.com>
+Date: Mon, 27 Jul 2026 06:11:53 -0700
+Subject: [PATCH 6/9] Configure total internal RMA context pool
+
+Signed-off-by: Zhenhao He <zhenhaoh@nvidia.com>
+---
+ src/include/rma/rma_proxy.h |  5 ++---
+ src/rma/rma_proxy.cc        | 15 +++++++--------
+ 2 files changed, 9 insertions(+), 11 deletions(-)
+
+diff --git a/src/include/rma/rma_proxy.h b/src/include/rma/rma_proxy.h
+index a28d8acad..b232e17c8 100644
+--- a/src/include/rma/rma_proxy.h
++++ b/src/include/rma/rma_proxy.h
+@@ -189,7 +189,7 @@ struct ncclRmaProxyState {
+   // numIntCtx) used by the hierarchical CE collectives' rail step. numIntCtx is
+   // 0 unless the internal-context guard holds (see ncclRmaProxyConnectOnce).
+   int rmaProxyCtxCount;       // total = numRmaCtx + numIntCtx
+-  int numIntCtx;              // count of internal contexts (NCCL_RMA_INT_CTX_PER_NIC * rmaCommCount, or 0)
++  int numIntCtx;              // total count of internal contexts
+   void** rmaProxyCtxs;
+   int rmaProgress;         // RMA progress is enabled
+   std::thread thread;
+@@ -207,8 +207,7 @@ ncclResult_t ncclRmaProxyReclaimPlan(struct ncclComm* comm, struct ncclKernelPla
+ ncclResult_t ncclRmaProxyConnectOnce(struct ncclComm* comm);
+ ncclResult_t ncclRmaProxyFinalize(struct ncclComm* comm);
+ 
+-// True when NCCL should provision internal RMA contexts for the hierarchical CE
+-// collectives: zero-CTA policy, a multi-clique (non-single-LSA) comm, > 1 node.
++// True when the communicator needs internal RMA contexts for hierarchical collectives
+ bool ncclRmaWantInternalCtx(struct ncclComm* comm);
+ 
+ // RMA Proxy context management
+diff --git a/src/rma/rma_proxy.cc b/src/rma/rma_proxy.cc
+index 73cf0ecda..f1ef4967f 100644
+--- a/src/rma/rma_proxy.cc
++++ b/src/rma/rma_proxy.cc
+@@ -388,10 +388,9 @@ void* ncclRmaProxyProgressThread(struct ncclRmaProxyState* rmaProxyState_) {
+   }
+ }
+ 
+-// Internal RMA contexts back the hierarchical CE collectives' inter-node rail.
+-// Provision them only on the path that actually uses them: the zero-CTA policy,
+-// a multi-clique comm (LSA does not span the comm), and more than one node --
+-// the same conditions under which the hierarchical CE collective is selected.
++// Return whether this communicator needs internal RMA contexts for the
++// hierarchical CE collectives' inter-node rail: zero-CTA policy, multiple LSA
++// teams, and more than one node.
+ bool ncclRmaWantInternalCtx(struct ncclComm* comm) {
+   return (comm->config.CTAPolicy & NCCL_CTA_POLICY_ZERO) && !ncclDevrIsOneLsaTeam(comm) && comm->nNodes > 1;
+ }
+@@ -466,15 +465,15 @@ ncclResult_t ncclRmaProxyConnectOnce(struct ncclComm* comm) {
+   // Create virtual RMA proxy contexts. The array is laid out as the
+   // user-addressable contexts [0, numRmaCtx) followed by NCCL-internal contexts
+   // [numRmaCtx, numRmaCtx + numIntCtx) for the hierarchical CE collectives. The
+-  // internal range is provisioned only when needed (NCCL_RMA_INT_CTX_PER_NIC
+-  // contexts per physical RMA communicator), so it stays empty on paths that
+-  // don't use it.
++  // internal range is provisioned only when needed (ncclNumRmaIntCtx() contexts
++  // total, distributed across the physical RMA communicators), so it stays empty
++  // on paths that don't use it.
+   rmaProxyState->numIntCtx = ncclRmaWantInternalCtx(comm) ? ncclNumRmaIntCtx() : 0;
+   rmaProxyState->rmaProxyCtxCount = comm->config.numRmaCtx + rmaProxyState->numIntCtx;
+   NCCLCHECK(ncclCalloc(&rmaProxyState->rmaProxyCtxs, rmaProxyState->rmaProxyCtxCount));
+   for (int n = 0; n < rmaProxyState->rmaProxyCtxCount; n++) {
+     // Both ranges map round-robin to the physical RMA communicators; the
+-    // internal range lands NCCL_RMA_INT_CTX_PER_NIC contexts on each.
++    // internal range spreads its numIntCtx contexts across them.
+     int collCommIdx = (n < comm->config.numRmaCtx ? n : n - comm->config.numRmaCtx) % rmaProxyState->rmaCommCount;
+     NCCLCHECKGOTO(ncclRmaProxyCreateContext(comm, rmaProxyState->rmaComms[collCommIdx],
+                                             rmaProxyState->props[collCommIdx], collCommIdx,

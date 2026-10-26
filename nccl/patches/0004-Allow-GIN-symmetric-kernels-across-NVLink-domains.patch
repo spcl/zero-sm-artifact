@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Siyuan Shen <siyshen@nvidia.com>
+Date: Mon, 5 Oct 2026 07:39:41 -0700
+Subject: [PATCH 4/9] Allow GIN symmetric kernels across NVLink domains
+
+ncclSymkAvailable() required all ranks to be connected by direct NVLink.
+When GIN is connected and a GIN kernel serves the collective, the symmetric
+kernels also work across NVLink domains, so skip that requirement there.
+
+Signed-off-by: Siyuan Shen <siyshen@nvidia.com>
+---
+ src/sym_kernels.cc | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/src/sym_kernels.cc b/src/sym_kernels.cc
+index 454dfa9f2..7e2ab60f0 100644
+--- a/src/sym_kernels.cc
++++ b/src/sym_kernels.cc
+@@ -354,10 +354,17 @@ uint32_t ncclSymkMask(struct ncclComm* comm, ncclFunc_t coll, int /*ncclDevRedOp
+ bool ncclSymkAvailable(struct ncclComm* comm, ncclFunc_t coll, int /*ncclDevRedOp_t*/ red, ncclDataType_t ty,
+                        size_t nElts) {
+   if (!comm->symmetricSupport) return false;
+-  if (!comm->isAllDirectNvlink) return false;
+   if (!ncclSymkImplemented(coll, red, ty)) return false;
+ 
+-  return (ncclSymkMask(comm, coll, red, ty, nElts) != 0);
++  uint32_t kmask = ncclSymkMask(comm, coll, red, ty, nElts);
++  // Symmetric kernels are also usable across NVLink domains when GIN is connected and a GIN
++  // kernel can serve this collective (ncclSymkMask already narrows the mask to GIN kernels
++  // whenever the LSA team is smaller than the communicator).
++  if (!comm->isAllDirectNvlink &&
++      (comm->globalGinSupport == NCCL_GIN_CONNECTION_NONE || !(kmask & kernelMask_Gin))) {
++    return false;
++  }
++  return kmask != 0;
+ }
+ 
+ const char* ncclSymkKernelIdToString(int kernelId) {

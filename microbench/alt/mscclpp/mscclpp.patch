@@ -1,0 +1,89 @@
+diff --git a/src/core/executor/execution_kernel.cu b/src/core/executor/execution_kernel.cu
+index d639efb7..874431ea 100644
+--- a/src/core/executor/execution_kernel.cu
++++ b/src/core/executor/execution_kernel.cu
+@@ -13,6 +13,7 @@ void ExecutionKernel::launchKernel(int rank, int nthreadblocks, int nthreads, vo
+                                    uint32_t sharedMemSize, cudaStream_t stream, uint32_t flag) {
+   switch (dataType) {
+     case DataType::INT32:
++      cudaFuncSetAttribute(executionKernel<int32_t, PacketType, ReuseScratch>, cudaFuncAttributeMaxDynamicSharedMemorySize, sharedMemSize);
+       executionKernel<int32_t, PacketType, ReuseScratch><<<nthreadblocks, nthreads, sharedMemSize, stream>>>(
+           rank, (int32_t*)src, (int32_t*)dst, (int32_t*)scratch, scratchOffset, scratchChunkSize, plan, semaphores,
+           localMemoryIdBegin, flag
+@@ -24,6 +25,7 @@ void ExecutionKernel::launchKernel(int rank, int nthreadblocks, int nthreads, vo
+ #endif
+       break;
+     case DataType::UINT32:
++      cudaFuncSetAttribute(executionKernel<uint32_t, PacketType, ReuseScratch>, cudaFuncAttributeMaxDynamicSharedMemorySize, sharedMemSize);
+       executionKernel<uint32_t, PacketType, ReuseScratch><<<nthreadblocks, nthreads, sharedMemSize, stream>>>(
+           rank, (uint32_t*)src, (uint32_t*)dst, (uint32_t*)scratch, scratchOffset, scratchChunkSize, plan, semaphores,
+           localMemoryIdBegin, flag
+@@ -35,6 +37,7 @@ void ExecutionKernel::launchKernel(int rank, int nthreadblocks, int nthreads, vo
+ #endif
+       break;
+     case DataType::UINT8:
++      cudaFuncSetAttribute(executionKernel<uint8_t, PacketType, ReuseScratch>, cudaFuncAttributeMaxDynamicSharedMemorySize, sharedMemSize);
+       executionKernel<uint8_t, PacketType, ReuseScratch><<<nthreadblocks, nthreads, sharedMemSize, stream>>>(
+           rank, (uint8_t*)src, (uint8_t*)dst, (uint8_t*)scratch, scratchOffset, scratchChunkSize, plan, semaphores,
+           localMemoryIdBegin, flag
+@@ -46,6 +49,7 @@ void ExecutionKernel::launchKernel(int rank, int nthreadblocks, int nthreads, vo
+ #endif
+       break;
+     case DataType::FLOAT16:
++      cudaFuncSetAttribute(executionKernel<half, PacketType, ReuseScratch>, cudaFuncAttributeMaxDynamicSharedMemorySize, sharedMemSize);
+       executionKernel<half, PacketType, ReuseScratch><<<nthreadblocks, nthreads, sharedMemSize, stream>>>(
+           rank, (half*)src, (half*)dst, (half*)scratch, scratchOffset, scratchChunkSize, plan, semaphores,
+           localMemoryIdBegin, flag
+@@ -57,6 +61,7 @@ void ExecutionKernel::launchKernel(int rank, int nthreadblocks, int nthreads, vo
+ #endif
+       break;
+     case DataType::FLOAT32:
++      cudaFuncSetAttribute(executionKernel<float, PacketType, ReuseScratch>, cudaFuncAttributeMaxDynamicSharedMemorySize, sharedMemSize);
+       executionKernel<float, PacketType, ReuseScratch><<<nthreadblocks, nthreads, sharedMemSize, stream>>>(
+           rank, (float*)src, (float*)dst, (float*)scratch, scratchOffset, scratchChunkSize, plan, semaphores,
+           localMemoryIdBegin, flag
+@@ -68,6 +73,7 @@ void ExecutionKernel::launchKernel(int rank, int nthreadblocks, int nthreads, vo
+ #endif
+       break;
+     case DataType::BFLOAT16:
++      cudaFuncSetAttribute(executionKernel<__bfloat16, PacketType, ReuseScratch>, cudaFuncAttributeMaxDynamicSharedMemorySize, sharedMemSize);
+       executionKernel<__bfloat16, PacketType, ReuseScratch><<<nthreadblocks, nthreads, sharedMemSize, stream>>>(
+           rank, (__bfloat16*)src, (__bfloat16*)dst, (__bfloat16*)scratch, scratchOffset, scratchChunkSize, plan,
+           semaphores, localMemoryIdBegin, flag
+diff --git a/src/core/include/execution_common.hpp b/src/core/include/execution_common.hpp
+index 6ce47d8f..58f96b27 100644
+--- a/src/core/include/execution_common.hpp
++++ b/src/core/include/execution_common.hpp
+@@ -14,7 +14,10 @@ constexpr int MAX_LOCAL_BUFFER_PER_OPERATION = 2;
+ 
+ constexpr int MAX_CHANNEL = 16;
+ constexpr int MAX_CHANNEL_PER_OPERATION = 8;
+-constexpr int MAX_OPERATION = 64;
++// The multi-node Simple/TBG AllGather plans emit up to 255 operations per
++// thread block at 64 ranks; the default of 64 rejects them. The plan stays
++// fixed-size and exceeds 48 KiB, hence the shared-memory attribute below.
++constexpr int MAX_OPERATION = 256;
+ 
+ constexpr int MAX_DEVICE_SYNCERS = 16;
+ constexpr int MAX_DEVICE_SEMAPHORES = 16;
+@@ -144,7 +147,7 @@ struct __attribute__((aligned(16))) DeviceExecutionPlan {
+   uint16_t nOperations;                 // 2 bytes
+   Channels channels;                    // 1792 bytes
+   RemoteBuffers remoteBuffers;          // 224 bytes
+-  Operation operations[MAX_OPERATION];  // 64 * 160 = 10240 bytes
++  Operation operations[MAX_OPERATION];  // 256 * 160 = 40960 bytes
+ };
+ 
+ }  // namespace mscclpp
+diff --git a/test/CMakeLists.txt b/test/CMakeLists.txt
+index 82b799dc..9e0bf5a5 100644
+--- a/test/CMakeLists.txt
++++ b/test/CMakeLists.txt
+@@ -34,6 +34,7 @@ add_test_executable(allgather_test_cpp allgather_test_cpp.cu)
+ add_test_executable(allgather_test_host_offloading allgather_test_host_offloading.cu)
+ add_test_executable(nvls_test nvls_test.cu)
+ add_test_executable(executor_test executor_test.cc)
++add_test_executable(executor_allgather_exact executor_allgather_exact.cc)
+ 
+ configure_file(run_mpi_test.sh.in run_mpi_test.sh)
+ 

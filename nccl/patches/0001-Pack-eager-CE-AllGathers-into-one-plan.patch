@@ -1,0 +1,269 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Siyuan Shen <siyshen@nvidia.com>
+Date: Mon, 17 Aug 2026 11:51:24 -0700
+Subject: [PATCH 1/9] Pack eager CE AllGathers into one plan
+
+Signed-off-by: Siyuan Shen <siyshen@nvidia.com>
+---
+ src/ce_coll.cc     | 190 +++++++++++++++++++++++++++++----------------
+ src/include/comm.h |   5 ++
+ 2 files changed, 128 insertions(+), 67 deletions(-)
+
+diff --git a/src/ce_coll.cc b/src/ce_coll.cc
+index 696902782..3d93168c5 100644
+--- a/src/ce_coll.cc
++++ b/src/ce_coll.cc
+@@ -26,10 +26,27 @@ NCCL_PARAM(CeChunkSize, "CE_CHUNK_SIZE", 8 * 1024 * 1024);
+ // When set, intra-device copies offload to the CE. NCCL sets this flag on NCCL_CTA_POLICY=ZERO when NCCL_CE_INTRA_GPU_MEMCPY_ENABLE=1 (default).
+ // Set to 0 to omit the flag and leave intra-device self-copies on SMs.
+ NCCL_PARAM(CeMemcpyOverlapEnable, "CE_INTRA_GPU_MEMCPY_ENABLE", 1);
++// Maximum number of consecutive eager CE AllGathers placed in one NCCL
++// execution plan. A value of one preserves the existing one-collective-per-
++// plan behavior. CUDA-graph plans are deliberately excluded because their RMA
++// descriptors have persistent lifetimes that must remain independently owned.
++NCCL_PARAM(CeCollPlanAgBatch, "CE_COLL_PLAN_AG_BATCH", 1);
++
++// Bound both scoped-memory consumption and the amount of work executed by one
++// plan callback when a user provides an excessively large environment value.
++static constexpr int CE_COLL_PLAN_AG_BATCH_MAX = 64;
+ 
+ // Static constant for graph synchronization
+ static const uint32_t GRAPH_SYNC_VALUE = 1;
+ 
++// Hierarchical CE helpers receive the plan rather than an argument pointer.
++// Plan packing advances this index before invoking an unchanged per-collective
++// protocol, so every helper observes the correct buffers and registered
++// windows without coupling packing to protocol fusion.
++static inline struct ncclCeCollArgs* ncclCePlanActiveArgs(struct ncclKernelPlan* plan) {
++  return &plan->ceCollArgs[plan->ceCollIndex];
++}
++
+ // Static constants for intra-batch synchronization to improve CE collective performance with large scale
+ // Frequency of intra-batch synchronization
+ static const uint32_t CE_COLL_INTRA_BATCH_SYNC_FREQ = 8;
+@@ -1315,7 +1332,7 @@ static ncclResult_t ncclHierCeAllGatherDirect(struct ncclComm* comm, struct nccl
+   int lsaSize = comm->devrState.lsaSize;
+   bool persistent = plan->persistent;
+ 
+-  struct ncclCeCollArgs* args = plan->ceCollArgs;
++  struct ncclCeCollArgs* args = ncclCePlanActiveArgs(plan);
+   const void* sendbuff = args->sendBuff;
+   void* recvbuff = args->recvBuff;
+   struct ncclDevrWindow* sendWin = args->sendWin;
+@@ -2135,7 +2152,7 @@ ncclResult_t ncclHierCeAlltoAll(struct ncclComm* comm, struct ncclKernelPlan* pl
+   int numRemotePeers = (nNodes - 1) * localRanks;
+   bool persistent = plan->persistent;
+ 
+-  struct ncclCeCollArgs* args = plan->ceCollArgs;
++  struct ncclCeCollArgs* args = ncclCePlanActiveArgs(plan);
+   const void* sendbuff = args->sendBuff;
+   void* recvbuff = args->recvBuff;
+   struct ncclDevrWindow* sendWin = args->sendWin;
+@@ -2389,49 +2406,60 @@ fail:
+ ncclResult_t ncclLaunchCeColl(struct ncclComm* comm, struct ncclKernelPlan* plan) {
+   ncclResult_t ret = ncclSuccess;
+   cudaStream_t stream = comm->planner.streams->stream;
+-  struct ncclCeCollArgs* args = plan->ceCollArgs;
+-
+-  // Start CE collective profiling
+-  NCCLCHECKGOTO(ncclProfilerStartCeCollEvent(comm, args, stream), ret, fail);
+-
+-  // Hierarchical path: inter-node RMA + intra-node CE
+-  // Use ncclDevrIsOneLsaTeam instead of comm->nNodes as multi-clique single-NVLD should use CE path
+-  if (!ncclDevrIsOneLsaTeam(comm)) {
+-    switch (args->func) {
+-    case ncclFuncAllGather:
+-      NCCLCHECKGOTO(ncclHierCeAllGather(comm, plan, stream), ret, fail);
+-      break;
+-    case ncclFuncAlltoAll:
+-      NCCLCHECKGOTO(ncclHierCeAlltoAll(comm, plan, stream), ret, fail);
+-      break;
+-    default:
+-      WARN("Hierarchical CE collective not supported for %s", ncclFuncToString(args->func));
+-      ret = ncclInvalidUsage;
+-    }
+-  }
+-  // LSA-local CE path
+-  else {
+-    switch (args->func) {
+-    case ncclFuncAllGather:
+-      NCCLCHECKGOTO(ncclCeAllGather(comm, args, stream), ret, fail);
+-      break;
+-    case ncclFuncAlltoAll:
+-      NCCLCHECKGOTO(ncclCeAlltoAll(comm, args, stream), ret, fail);
+-      break;
+-    case ncclFuncScatter:
+-      NCCLCHECKGOTO(ncclCeScatter(comm, args, stream), ret, fail);
+-      break;
+-    case ncclFuncGather:
+-      NCCLCHECKGOTO(ncclCeGather(comm, args, stream), ret, fail);
+-      break;
+-    default:
+-      ret = ncclInvalidUsage;
++  struct ncclCeCollArgs* args = nullptr;
++  bool profilerStarted = false;
++
++  // Packing changes only plan ownership and launch amortization. Execute each
++  // member's established local or hierarchical protocol in original queue
++  // order, retaining its own profiler event, buffers, windows, and algorithm.
++  for (plan->ceCollIndex = 0; plan->ceCollIndex < plan->nCeColls; plan->ceCollIndex++) {
++    args = ncclCePlanActiveArgs(plan);
++    NCCLCHECKGOTO(ncclProfilerStartCeCollEvent(comm, args, stream), ret, fail);
++    profilerStarted = true;
++
++    // Hierarchical path: inter-node RMA + intra-node CE. Use
++    // ncclDevrIsOneLsaTeam instead of comm->nNodes because a multi-clique,
++    // single-NVLD communicator belongs on the LSA-local CE path.
++    if (!ncclDevrIsOneLsaTeam(comm)) {
++      switch (args->func) {
++      case ncclFuncAllGather:
++        NCCLCHECKGOTO(ncclHierCeAllGather(comm, plan, stream), ret, fail);
++        break;
++      case ncclFuncAlltoAll:
++        NCCLCHECKGOTO(ncclHierCeAlltoAll(comm, plan, stream), ret, fail);
++        break;
++      default:
++        WARN("Hierarchical CE collective not supported for %s", ncclFuncToString(args->func));
++        ret = ncclInvalidUsage;
++      }
++    } else {
++      // LSA-local CE path.
++      switch (args->func) {
++      case ncclFuncAllGather:
++        NCCLCHECKGOTO(ncclCeAllGather(comm, args, stream), ret, fail);
++        break;
++      case ncclFuncAlltoAll:
++        NCCLCHECKGOTO(ncclCeAlltoAll(comm, args, stream), ret, fail);
++        break;
++      case ncclFuncScatter:
++        NCCLCHECKGOTO(ncclCeScatter(comm, args, stream), ret, fail);
++        break;
++      case ncclFuncGather:
++        NCCLCHECKGOTO(ncclCeGather(comm, args, stream), ret, fail);
++        break;
++      default:
++        ret = ncclInvalidUsage;
++      }
+     }
++
++    ncclProfilerStopCeCollEvent(comm, args, stream);
++    profilerStarted = false;
+   }
+ 
+ exit:
+-  // Stop CE collective profiling - always attempt if started, even on error
+-  ncclProfilerStopCeCollEvent(comm, args, stream);
++  plan->ceCollIndex = 0;
++  // Balance the current member's profiler event if its protocol failed.
++  if (profilerStarted) ncclProfilerStopCeCollEvent(comm, args, stream);
+   return ret;
+ fail:
+   goto exit;
+@@ -2439,37 +2467,65 @@ fail:
+ 
+ ncclResult_t scheduleCeCollTaskToPlan(struct ncclComm* comm, struct ncclKernelPlan* plan) {
+   struct ncclKernelPlanner* planner = &comm->planner;
+-  struct ncclTaskColl* task = ncclIntruQueueHead(&planner->collCeTaskQueue);
++  struct ncclTaskColl* firstTask = ncclIntruQueueHead(&planner->collCeTaskQueue);
++  int64_t requestedBatch = ncclParamCeCollPlanAgBatch();
++  if (requestedBatch < 1) requestedBatch = 1;
++  if (requestedBatch > CE_COLL_PLAN_AG_BATCH_MAX) requestedBatch = CE_COLL_PLAN_AG_BATCH_MAX;
++  int maxBatch = (int)requestedBatch;
++  int nTasks = 1;
++
++  // Only consecutive eager AllGathers are eligible. Stopping at the first
++  // different operation preserves queue order, while excluding persistent
++  // plans avoids combining independently owned CUDA-graph/RMA resources.
++  if (!plan->persistent && firstTask->func == ncclFuncAllGather && maxBatch > 1) {
++    for (struct ncclTaskColl* task = firstTask->next;
++         task != nullptr && task->func == ncclFuncAllGather && nTasks < maxBatch;
++         task = task->next) {
++      nTasks++;
++    }
++  }
+ 
+   plan->isCeColl = true;
+-  plan->ceCollArgs = ncclMemoryStackAlloc<struct ncclCeCollArgs>(&comm->memScoped);
+-  plan->ceCollArgs->rootRank = task->root;
+-  plan->ceCollArgs->datatype = task->datatype;
+-  plan->ceCollArgs->nElts = task->count;
+-  plan->ceCollArgs->eltSize = ncclTypeSize(task->datatype);
+-  plan->ceCollArgs->sendBuff = (uint8_t*)task->sendbuff;
+-  plan->ceCollArgs->recvBuff = (uint8_t*)task->recvbuff;
+-  plan->ceCollArgs->func = task->func;
+-  plan->ceCollArgs->sendWin = task->sendWin;
+-  plan->ceCollArgs->recvWin = task->recvWin;
+-  plan->ceCollArgs->collApiEventHandle = task->collApiEventHandle;
+-  plan->ceCollArgs->userTag = task->profilerTag;
+-
+-  if (comm->rank == 0) {
+-    if (!ncclDevrIsOneLsaTeam(comm)) {
+-      if (task->func != ncclFuncAllGather)
+-        INFO(NCCL_TUNING, "%s [Hierarchical CE]: %ld Bytes -> RMA proxy + CE", ncclFuncToString(task->func),
+-             task->count * ncclTypeSize(task->datatype));
+-    } else {
+-      const char* nvlsSync = comm->symkState.hasLsaMultimem ? "; CE synchronization with NVLS" : "";
+-      INFO(NCCL_TUNING, "%s [Copy Engine]: %ld Bytes -> cudaMemcpy%s", ncclFuncToString(task->func),
+-           task->count * ncclTypeSize(task->datatype), nvlsSync);
++  plan->nCeColls = nTasks;
++  plan->ceCollIndex = 0;
++  plan->ceCollArgs = ncclMemoryStackAlloc<struct ncclCeCollArgs>(&comm->memScoped, nTasks);
++
++  // Each packed member keeps a complete argument record. This is what makes
++  // packing independent of message size, datatype, registration window, and
++  // the CE protocol selected later for that member.
++  for (int i = 0; i < nTasks; i++) {
++    struct ncclTaskColl* task = ncclIntruQueueDequeue(&planner->collCeTaskQueue);
++    struct ncclCeCollArgs* args = &plan->ceCollArgs[i];
++    args->rootRank = task->root;
++    args->datatype = task->datatype;
++    args->nElts = task->count;
++    args->eltSize = ncclTypeSize(task->datatype);
++    args->sendBuff = (uint8_t*)task->sendbuff;
++    args->recvBuff = (uint8_t*)task->recvbuff;
++    args->func = task->func;
++    args->sendWin = task->sendWin;
++    args->recvWin = task->recvWin;
++    args->collApiEventHandle = task->collApiEventHandle;
++    args->userTag = task->profilerTag;
++
++    if (comm->rank == 0) {
++      if (!ncclDevrIsOneLsaTeam(comm)) {
++        if (task->func != ncclFuncAllGather)
++          INFO(NCCL_TUNING, "%s [Hierarchical CE]: %ld Bytes -> RMA proxy + CE", ncclFuncToString(task->func),
++               task->count * ncclTypeSize(task->datatype));
++      } else {
++        const char* nvlsSync = comm->symkState.hasLsaMultimem ? "; CE synchronization with NVLS" : "";
++        INFO(NCCL_TUNING, "%s [Copy Engine]: %ld Bytes -> cudaMemcpy%s", ncclFuncToString(task->func),
++             task->count * ncclTypeSize(task->datatype), nvlsSync);
++      }
+     }
++
++    ncclMemoryPoolFree(&comm->memPool_ncclTaskColl, task);
+   }
+ 
++  if (comm->rank == 0 && nTasks > 1) {
++    INFO(NCCL_TUNING, "CE plan packed %d consecutive eager AllGather tasks", nTasks);
++  }
+   ncclIntruQueueEnqueue(&planner->planQueue, plan);
+-  ncclIntruQueueDequeue(&planner->collCeTaskQueue);
+-  ncclMemoryPoolFree(&comm->memPool_ncclTaskColl, task);
+-
+   return ncclSuccess;
+ }
+diff --git a/src/include/comm.h b/src/include/comm.h
+index baaa38427..61dbb087f 100644
+--- a/src/include/comm.h
++++ b/src/include/comm.h
+@@ -377,6 +377,11 @@ struct ncclKernelPlan {
+     struct ncclCeCollArgs* ceCollArgs;
+     struct ncclRmaArgs* rmaArgs;
+   };
++  // Eager CE plans may own several consecutive AllGather argument records.
++  // ceCollIndex selects the record consumed by existing hierarchical helpers;
++  // persistent plans and all other CE collectives keep nCeColls equal to one.
++  int nCeColls;
++  int ceCollIndex;
+   size_t kernelArgsSize;
+   uint64_t channelMask; // bitset of which channels are present
+   bool hasProxyOps; // does any channel have a non-empty proxyOpQueue

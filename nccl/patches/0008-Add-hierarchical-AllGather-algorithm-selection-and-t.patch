@@ -1,0 +1,103 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Zhenhao He <zhenhaoh@nvidia.com>
+Date: Mon, 27 Jul 2026 06:13:43 -0700
+Subject: [PATCH 8/9] Add hierarchical AllGather algorithm selection and tuning
+
+Signed-off-by: Zhenhao He <zhenhaoh@nvidia.com>
+---
+ src/ce_coll.cc | 46 ++++++++++++++++++++++++++++++++++------------
+ 1 file changed, 34 insertions(+), 12 deletions(-)
+
+diff --git a/src/ce_coll.cc b/src/ce_coll.cc
+index e088db41f..48f143e5d 100644
+--- a/src/ce_coll.cc
++++ b/src/ce_coll.cc
+@@ -110,11 +110,22 @@ static const uint32_t CE_COLL_INTRA_BATCH_SYNC_FREQ = 8;
+ // Message threshold for intra-batch synchronization
+ static const uint64_t CE_COLL_INTRA_BATCH_SYNC_MSG_THRESHOLD = 512 * 1024 * 1024;
+ 
++// --------------------------------------------------------------------
++// Hierarchical CE: chunking
++// --------------------------------------------------------------------
++
+ // Maximum size of a single sub-chunk for hierarchical collective
+ static constexpr size_t HIER_COLL_MAX_CHUNK_SIZE = 64 * 1024 * 1024;
+ // Alignment of hierarchical-collective sub-chunks. Shared by the chunk-plan
+ // builder and the chunk-width computation, which must agree on it.
+ static constexpr size_t HIER_COLL_CHUNK_ALIGN = 8 * 1024;
++// Smallest sub-chunk in the geometric drain of the paced AllGather's final
++// multi-context wave.
++static constexpr size_t HIER_COLL_GEOMETRIC_TAIL_MIN_CHUNK = 1 * 1024 * 1024;
++
++// Split the paced AllGather's final multi-context wave into a large-to-small
++// geometric drain. Set to 0 to restore uniform terminal chunking.
++NCCL_PARAM(HierCeCollAgGeometricTail, "HIER_CE_COLL_AG_GEOMETRIC_TAIL", 1);
+ 
+ // --------------------------------------------------------------------
+ // Hierarchical CE AllGather: Ring selection and chunking
+@@ -124,12 +135,28 @@ static constexpr size_t HIER_COLL_CHUNK_ALIGN = 8 * 1024;
+ // clearly bandwidth-dominated.
+ static constexpr size_t HIER_COLL_AG_RING_HALF_AWARE_THRESHOLD = 128 * 1024 * 1024;
+ static constexpr size_t HIER_COLL_AG_RING_MIN_HALF_AWARE_CHUNK = 8 * 1024 * 1024;
++static constexpr int HIER_COLL_AG_RING_MIN_NNODES_DEFAULT = 16;
++static constexpr int HIER_COLL_AG_RING_LARGE_SCALE_NNODES_DEFAULT = 32;
++static constexpr size_t HIER_COLL_AG_RING_MIN_RECV_BYTES_DEFAULT = 2ULL * 1024 * 1024 * 1024;
++static constexpr size_t HIER_COLL_AG_RING_LARGE_SCALE_MIN_RECV_BYTES_DEFAULT = 1ULL * 1024 * 1024 * 1024;
+ 
+-// Ring is opt-in in this MR: a positive value enables it, while zero or a
+-// negative value keeps the Direct path. The stacked tuning MR gives -1 its
+-// automatic-selection semantics.
++// Override bidirectional ring selection: -1 selects automatically, 0 disables
++// it, and any positive value forces it.
+ NCCL_PARAM(HierCeCollAgRailRingEnable, "HIER_CE_COLL_AG_RAIL_RING_ENABLE", -1);
+ 
++static bool ncclHierAllGatherUseRing(struct ncclComm* comm, size_t perRankBytes) {
++  int64_t ringOverride = ncclParamHierCeCollAgRailRingEnable();
++  if (ringOverride >= 0) return ringOverride != 0;
++  if (comm->nNodes < HIER_COLL_AG_RING_MIN_NNODES_DEFAULT || comm->nRanks <= 0) return false;
++
++  // AllGather's final receive size on each rank is perRankBytes * nRanks.
++  // Compare by division to avoid overflowing that product.
++  size_t minRecvBytes = comm->nNodes >= HIER_COLL_AG_RING_LARGE_SCALE_NNODES_DEFAULT ?
++                          HIER_COLL_AG_RING_LARGE_SCALE_MIN_RECV_BYTES_DEFAULT :
++                          HIER_COLL_AG_RING_MIN_RECV_BYTES_DEFAULT;
++  return perRankBytes >= DIVUP(minRecvBytes, (size_t)comm->nRanks);
++}
++
+ // Minimum per-peer transfer size (bytes) for the hierarchical CE collectives to
+ // distribute their inter-node rail traffic across multiple internal RMA
+ // contexts. 0 distributes regardless of size; -1 selects the built-in default.
+@@ -139,16 +166,9 @@ static constexpr int64_t HIER_COLL_MULTI_CTX_THRESHOLD_DEFAULT = 4 * 1024 * 1024
+ // all-to-all rail path is selected.
+ NCCL_PARAM(HierCeCollAgRailPipeThreshold, "HIER_CE_COLL_AG_RAIL_PIPE_THRESHOLD", -1);
+ static constexpr int64_t HIER_COLL_AG_RAIL_PIPE_THRESHOLD_DEFAULT = 4 * 1024 * 1024;
+-// Smallest sub-chunk in the geometric drain of the paced AllGather's final
+-// multi-context wave.
+-static constexpr size_t HIER_COLL_GEOMETRIC_TAIL_MIN_CHUNK = 1 * 1024 * 1024;
+-
+ // Software-pipeline depth for paced all-to-all. A positive value overrides
+ // the automatic default (depth 1 below 16 nodes, depth 4 at 16+ nodes).
+ NCCL_PARAM(HierCeCollAgRailPipeDepth, "HIER_CE_COLL_AG_RAIL_PIPE_DEPTH", -1);
+-// Split the paced all-to-all's final multi-context wave into a large-to-small
+-// geometric drain. Set to 0 to restore uniform terminal chunking.
+-NCCL_PARAM(HierCeCollAgGeometricTail, "HIER_CE_COLL_AG_GEOMETRIC_TAIL", 1);
+ 
+ static bool ncclHierAllGatherUsePipe(size_t perRankBytes) {
+   int64_t threshold = ncclParamHierCeCollAgRailPipeThreshold();
+@@ -2671,12 +2691,14 @@ fail:
+ 
+ ncclResult_t ncclHierCeAllGather(struct ncclComm* comm, struct ncclKernelPlan* plan, cudaStream_t stream) {
+   size_t perRankBytes = plan->ceCollArgs->nElts * plan->ceCollArgs->eltSize;
+-  bool useRing = ncclParamHierCeCollAgRailRingEnable() > 0;
+-  const char* railAlgo = useRing ? "Ring" : "Direct";
++  bool useRing = ncclHierAllGatherUseRing(comm, perRankBytes);
++  bool usePipe = !useRing && ncclHierAllGatherUsePipe(perRankBytes);
++  const char* railAlgo = useRing ? "Ring" : usePipe ? "Pipe" : "Direct";
+   if (comm->rank == 0)
+     INFO(NCCL_TUNING, "AllGather [Hierarchical CE]: %zu Bytes -> Rail %s RMA proxy + CE", perRankBytes, railAlgo);
+ 
+   if (useRing) return ncclHierCeAllGatherRing(comm, plan, stream);
++  if (usePipe) return ncclHierCeAllGatherPipe(comm, plan, stream);
+   return ncclHierCeAllGatherDirect(comm, plan, stream);
+ }
+ 

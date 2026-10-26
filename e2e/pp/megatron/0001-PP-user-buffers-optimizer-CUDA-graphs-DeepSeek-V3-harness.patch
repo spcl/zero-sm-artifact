@@ -1,0 +1,2768 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: artifact <artifact@localhost>
+Date: Thu, 1 Oct 2026 00:00:00 +0000
+Subject: [PATCH] Pipeline-parallel user buffers, optimizer CUDA graphs and
+ DeepSeek-V3 harness
+
+- Initialize NCCL user-buffer data-parallel groups in a fixed global order
+  with the same number of global barriers on every pipeline stage.
+- Skip the grad-norm skip threshold while optimizer CUDA graphs are active.
+- Add examples/zero_sm_pp/deepseek_mlperf: Python entry point, callbacks and
+  Hydra configuration of the DeepSeek-V3 training recipe.
+---
+ .../deepseek_mlperf/callback_eval_cp.py       | 334 +++++++++
+ .../deepseek_mlperf/callback_logging.py       | 348 +++++++++
+ .../callback_memory_profiler.py               | 194 +++++
+ .../deepseek_mlperf/callback_warmup.py        | 599 ++++++++++++++++
+ .../conf/data_prefix/benchmark_c4.yaml        |   9 +
+ .../conf/data_prefix/full_c4.yaml             |  16 +
+ .../conf/data_prefix/synthetic.yaml           |   1 +
+ .../conf/data_prefix/train_only_c4.yaml       |   4 +
+ .../deepseek_mlperf/conf/deepseekv3_671b.yaml |  88 +++
+ .../deepseek_mlperf/conf/model/12layer.yaml   |  15 +
+ .../deepseek_mlperf/conf/model/16expert.yaml  |   8 +
+ .../deepseek_mlperf/conf/model/671b.yaml      | 125 ++++
+ .../conf/model/671b_5layers.yaml              |  11 +
+ .../conf/model/671b_small.yaml                |  11 +
+ .../deepseek_mlperf/conf/model/small.yaml     |  15 +
+ .../conf/nccl/custom_communicator_cta.yaml    |  42 ++
+ .../zero_sm_pp/deepseek_mlperf/pretrain.py    | 668 ++++++++++++++++++
+ examples/zero_sm_pp/deepseek_mlperf/utils.py  |  50 ++
+ .../core/distributed/param_and_grad_buffer.py |  35 +-
+ megatron/core/optimizer/optimizer.py          |   6 +-
+ 20 files changed, 2574 insertions(+), 5 deletions(-)
+ create mode 100644 examples/zero_sm_pp/deepseek_mlperf/callback_eval_cp.py
+ create mode 100755 examples/zero_sm_pp/deepseek_mlperf/callback_logging.py
+ create mode 100755 examples/zero_sm_pp/deepseek_mlperf/callback_memory_profiler.py
+ create mode 100755 examples/zero_sm_pp/deepseek_mlperf/callback_warmup.py
+ create mode 100755 examples/zero_sm_pp/deepseek_mlperf/conf/data_prefix/benchmark_c4.yaml
+ create mode 100755 examples/zero_sm_pp/deepseek_mlperf/conf/data_prefix/full_c4.yaml
+ create mode 100755 examples/zero_sm_pp/deepseek_mlperf/conf/data_prefix/synthetic.yaml
+ create mode 100755 examples/zero_sm_pp/deepseek_mlperf/conf/data_prefix/train_only_c4.yaml
+ create mode 100755 examples/zero_sm_pp/deepseek_mlperf/conf/deepseekv3_671b.yaml
+ create mode 100755 examples/zero_sm_pp/deepseek_mlperf/conf/model/12layer.yaml
+ create mode 100755 examples/zero_sm_pp/deepseek_mlperf/conf/model/16expert.yaml
+ create mode 100755 examples/zero_sm_pp/deepseek_mlperf/conf/model/671b.yaml
+ create mode 100644 examples/zero_sm_pp/deepseek_mlperf/conf/model/671b_5layers.yaml
+ create mode 100644 examples/zero_sm_pp/deepseek_mlperf/conf/model/671b_small.yaml
+ create mode 100755 examples/zero_sm_pp/deepseek_mlperf/conf/model/small.yaml
+ create mode 100755 examples/zero_sm_pp/deepseek_mlperf/conf/nccl/custom_communicator_cta.yaml
+ create mode 100755 examples/zero_sm_pp/deepseek_mlperf/pretrain.py
+ create mode 100755 examples/zero_sm_pp/deepseek_mlperf/utils.py
+
+diff --git a/examples/zero_sm_pp/deepseek_mlperf/callback_eval_cp.py b/examples/zero_sm_pp/deepseek_mlperf/callback_eval_cp.py
+new file mode 100644
+index 000000000..534a55459
+--- /dev/null
++++ b/examples/zero_sm_pp/deepseek_mlperf/callback_eval_cp.py
+@@ -0,0 +1,334 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import functools
++import logging
++from contextlib import contextmanager
++from typing import Any, Callable, Iterator, Optional
++
++import torch
++import torch.distributed as dist
++from megatron.bridge.training.callbacks import Callback, CallbackContext
++from megatron.bridge.training.utils.pg_utils import get_pg_collection
++from megatron.core.utils import get_model_config
++
++logger = logging.getLogger(__name__)
++
++
++_PG_FIELDS = ("cp", "dp", "dp_cp", "tp_cp", "tp_dp_cp", "intra_dp_cp", "hcp")
++_MODULE_ATTRS = {
++    "cp_group": "cp",
++    "tp_cp_group": "tp_cp",
++    "tp_dp_cp_group": "tp_dp_cp",
++    "dp_cp_group": "dp_cp",
++}
++_MCORE_PARALLEL_STATE_GLOBALS = {
++    "_CONTEXT_PARALLEL_GROUP": "cp",
++    "_HIERARCHICAL_CONTEXT_PARALLEL_GROUPS": "hcp",
++    "_DATA_PARALLEL_GROUP_WITH_CP": "dp_cp",
++    "_TENSOR_AND_CONTEXT_PARALLEL_GROUP": "tp_cp",
++    "_TENSOR_AND_DATA_PARALLEL_GROUP_WITH_CP": "tp_dp_cp",
++}
++_YARN_KEYS = ("max_seq_len_cached", "offset_cached", "dtype_cached", "packed_seq_cached")
++_YARN_BUFFERS = ("cos_cached", "sin_cached")
++
++
++class EvalCPCallback(Callback):
++    """Swap CP topology around every evaluation pass."""
++
++    _data_iter_patched = False
++    _validate_patched = False
++    _active: "Optional[EvalCPCallback]" = None
++
++    def __init__(self, eval_cp_size: int) -> None:
++        self._eval_cp = eval_cp_size
++        self._eval_pg: Any = None
++        self._cfg_container: Any = None
++        self._restore: list[Callable[[], None]] = []
++        self._eval_yarn_cache: dict[int, dict[str, Any]] = {}
++        EvalCPCallback._active = self
++        if not EvalCPCallback._validate_patched:
++            EvalCPCallback._validate_patched = True
++            self._patch_config_validate()
++
++    @classmethod
++    def get_active(cls) -> "Optional[EvalCPCallback]":
++        return cls._active
++
++    @property
++    def eval_dp_group(self) -> Any:
++        return None if self._eval_pg is None else self._eval_pg.dp
++
++    @contextmanager
++    def eval_topology(self, model: Any) -> Iterator[Any]:
++        """Apply the eval CP swap for the duration of the with-block.
++
++        Used by code paths that bypass on_eval_start/end hooks (e.g. warmup).
++        """
++        if self._eval_pg is None:
++            yield None
++            return
++        self._apply(model)
++        try:
++            yield self._eval_pg
++        finally:
++            self._undo()
++
++    def on_data_init_start(self, ctx: CallbackContext) -> None:
++        """Build eval pg before warmup runs (warmup's eval_topology needs it)."""
++        if self._eval_pg is not None:
++            return
++        self._cfg_container = ctx.state.cfg
++        self._eval_pg = _build_eval_pg(ctx.state.cfg, self._eval_cp)
++        if not EvalCPCallback._data_iter_patched:
++            EvalCPCallback._data_iter_patched = True
++            self._patch_setup_data_iterators()
++
++    def on_eval_start(self, ctx: CallbackContext) -> None:
++        if self._eval_pg is not None:
++            self._apply(ctx.model)
++
++    def on_eval_end(self, ctx: CallbackContext) -> None:
++        self._undo()
++
++    on_test_start = on_eval_start
++    on_test_end = on_eval_end
++
++    def _patch_config_validate(self) -> None:
++        """Pre-shrink data_parallel_size for validate()'s eval_gbs divisibility check."""
++        from megatron.bridge.training import config as _cfg_mod
++        cls = _cfg_mod.ConfigContainer
++        original = cls.validate
++        eval_cp = self._eval_cp
++
++        def patched(cc_self) -> None:
++            train_cp = cc_self.model.context_parallel_size
++            dp_total = cc_self.data_parallel_size * train_cp
++            if eval_cp <= 1 or dp_total % eval_cp != 0:
++                original(cc_self)
++                return
++            saved_dp = cc_self.data_parallel_size
++            cc_self.data_parallel_size = dp_total // eval_cp
++            try:
++                original(cc_self)
++            finally:
++                cc_self.data_parallel_size = saved_dp
++
++        cls.validate = patched
++
++    def _patch_setup_data_iterators(self) -> None:
++        """Rebuild eval/test iterators at eval_dp by re-calling the original with dp_group=eval_pg.dp."""
++        from megatron.bridge.training import setup as sm
++        original = sm.setup_data_iterators
++        outer = self
++
++        def patched(**kw: Any) -> tuple:
++            train_iter, _, _ = original(**kw)
++            cfg = kw["cfg"]
++            eval_dp_size = outer._eval_pg.dp.size()
++
++            # Throwaway-train sampler built during the second call asserts
++            # gbs % (mbs * dp_size) against eval_dp. Relax it; eval iters
++            # don't read train.gbs.
++            saved_gbs = cfg.train.global_batch_size
++            divisor = cfg.train.micro_batch_size * eval_dp_size
++            if saved_gbs % divisor != 0:
++                cfg.train.global_batch_size = divisor
++            try:
++                kw["dp_group"] = outer._eval_pg.dp
++                _, eval_v, eval_t = original(**kw)
++            finally:
++                cfg.train.global_batch_size = saved_gbs
++            return train_iter, eval_v, eval_t
++
++        sm.setup_data_iterators = patched
++
++    def _save_set(self, obj: Any, attr: str, new: Any) -> None:
++        old = getattr(obj, attr)
++        self._restore.append(lambda: setattr(obj, attr, old))
++        setattr(obj, attr, new)
++
++    def _undo(self) -> None:
++        for cb in reversed(self._restore):
++            cb()
++        self._restore.clear()
++
++    def _apply(self, model: Any) -> None:
++        from megatron.core.extensions.transformer_engine import TEDotProductAttention
++
++        chunks = model if isinstance(model, list) else [model]
++        modules = [m for c in chunks for m in c.modules()]
++        train_pg = get_pg_collection(model)
++        # Bridge passes the same model_cfg object to every chunk's
++        # model_provider_func, so chunks share one config instance.
++        model_cfg = get_model_config(chunks[0])
++        eval_pg = self._eval_pg
++        eval_cp = eval_pg.cp
++        eval_size = eval_cp.size()
++        eval_dp_size = eval_pg.dp.size()
++
++        if torch.distributed.get_rank() == 0:
++            logger.info(
++                f"[EvalCPCallback] applying swap: train_cp={train_pg.cp.size()} -> eval_cp={eval_size}, "
++                f"train_dp={train_pg.dp.size()} -> eval_dp={eval_dp_size}"
++            )
++
++        # Snapshot TE attention state BEFORE swap. m.cp_group is None when
++        # train_cp==1 (TE.__init__ gates the CP setup on context_parallel_size>1),
++        # but we still need to wire eval CP. Driving both apply and restore from
++        # this snapshot keeps that case correct.
++        cfg_cp_comm_type = getattr(model_cfg, "cp_comm_type", None)
++        if not isinstance(cfg_cp_comm_type, str):
++            cfg_cp_comm_type = None
++        te_train_state: list = []
++        for m in modules:
++            if not isinstance(m, TEDotProductAttention):
++                continue
++            train_group = m.cp_group
++            train_ranks = (
++                dist.get_process_group_ranks(train_group)
++                if train_group is not None
++                else getattr(m, "cp_global_ranks", None)
++            )
++            comm_type = cfg_cp_comm_type or getattr(m, "cp_comm_type", None) or "p2p"
++            te_train_state.append((m, train_group, train_ranks, comm_type))
++
++        # 1. model_config + train pg_collection fields + ConfigContainer.
++        self._save_set(model_cfg, "context_parallel_size", eval_size)
++        for f in _PG_FIELDS:
++            new = getattr(eval_pg, f, None)
++            if new is not None:
++                self._save_set(train_pg, f, new)
++        if self._cfg_container is not None:
++            # Read by evaluate() to compute eval_num_microbatches.
++            self._save_set(self._cfg_container, "data_parallel_size", eval_dp_size)
++
++        # 2. mcore parallel_state module-level globals (read directly by code
++        # that bypasses pg_collection).
++        try:
++            from megatron.core import parallel_state as mpu
++            for global_name, pg_field in _MCORE_PARALLEL_STATE_GLOBALS.items():
++                new_value = getattr(eval_pg, pg_field, None)
++                if new_value is not None and hasattr(mpu, global_name):
++                    self._save_set(mpu, global_name, new_value)
++        except ImportError:
++            pass
++
++        # 3. Per-module pg_collection + cached cp_group refs.
++        for m in modules:
++            if hasattr(m, "pg_collection"):
++                self._save_set(m, "pg_collection", eval_pg)
++            for attr, pg_field in _MODULE_ATTRS.items():
++                if hasattr(m, attr):
++                    self._save_set(m, attr, getattr(eval_pg, pg_field, None))
++            if isinstance(getattr(m, "cp_size", None), int):
++                self._save_set(m, "cp_size", eval_size)
++
++        # 4. YarnRotaryEmbedding cos/sin buffers. The wrapper installed here
++        # makes cp_group part of forward()'s lru_cache key — full-iteration
++        # CUDA graphs may have captured cached tensor pointers, so do NOT
++        # cache_clear; instead let train/eval coexist as separate entries.
++        YarnRotaryEmbedding = _wrap_yarn_forward()
++        if YarnRotaryEmbedding is not None:
++            for m in modules:
++                if not isinstance(m, YarnRotaryEmbedding) or not hasattr(m, "cos_cached"):
++                    continue
++                train_snap = _snapshot_yarn(m)
++                self._restore.append(lambda m=m, s=train_snap: self._restore_yarn(m, s))
++                eval_snap = self._eval_yarn_cache.get(id(m))
++                if eval_snap is None:
++                    m._set_cos_sin_cache(*[train_snap[f] for f in _YARN_KEYS])
++                    self._eval_yarn_cache[id(m)] = _snapshot_yarn(m)
++                else:
++                    _set_yarn_state(m, eval_snap)
++
++        # 5. TE attention: runtime equivalent of construction-time CP setup.
++        if getattr(TEDotProductAttention, "cp_stream", None) is None:
++            TEDotProductAttention.cp_stream = torch.cuda.Stream()
++        stream = TEDotProductAttention.cp_stream
++        eval_ranks = dist.get_process_group_ranks(eval_cp)
++        for m, train_group, train_ranks, comm_type in te_train_state:
++            restore_stream = stream if train_group is not None else None
++            self._restore.append(
++                lambda m=m, g=train_group, r=train_ranks, s=restore_stream, t=comm_type:
++                    m.set_context_parallel_group(g, r, s, t)
++            )
++            m.set_context_parallel_group(eval_cp, eval_ranks, stream, comm_type)
++
++    def _restore_yarn(self, m: Any, train_snap: dict) -> None:
++        # Eval forward may grow/retype Yarn cos/sin buffers. Keep the final
++        # eval tensors alive for validation CUDA-graph replay, then put train
++        # tensors back on the module.
++        self._eval_yarn_cache[id(m)] = _snapshot_yarn(m)
++        _set_yarn_state(m, train_snap)
++
++
++def _wrap_yarn_forward() -> Optional[type]:
++    """Inject self.cp_group into YarnRotaryEmbedding.forward's lru_cache key.
++
++    Idempotent — flag stored on the class's own __dict__ (not via setattr-and-
++    getattr) so MRO inheritance does not skip a future subclass.
++    """
++    try:
++        from megatron.core.models.common.embeddings.yarn_rotary_pos_embedding import YarnRotaryEmbedding
++    except ImportError:
++        return None
++
++    if YarnRotaryEmbedding.__dict__.get("_eval_cp_injected", False):
++        return YarnRotaryEmbedding
++    original = YarnRotaryEmbedding.forward
++    if not hasattr(original, "cache_clear"):
++        return YarnRotaryEmbedding
++
++    @functools.wraps(original)
++    def wrapped(self, max_seq_len, offset=0, packed_seq=False, cp_group=None):
++        if cp_group is None:
++            cp_group = self.cp_group
++        return original(self, max_seq_len, offset, packed_seq, cp_group)
++
++    YarnRotaryEmbedding.forward = wrapped
++    YarnRotaryEmbedding._eval_cp_injected = True  # type: ignore[attr-defined]
++    return YarnRotaryEmbedding
++
++
++def _snapshot_yarn(m: Any) -> dict:
++    return {f: getattr(m, f) for f in _YARN_KEYS + _YARN_BUFFERS}
++
++
++def _set_yarn_state(m: Any, snap: dict) -> None:
++    for f in _YARN_KEYS:
++        setattr(m, f, snap[f])
++    for f in _YARN_BUFFERS:
++        m.register_buffer(f, snap[f], persistent=False)
++
++
++def _build_eval_pg(cfg: Any, eval_cp_size: int) -> Any:
++    """pg_collection sized for eval_cp_size, sharing TP/PP with the train pg."""
++    from megatron.bridge.models.gpt.gpt_builder import GPTModelConfig
++    from megatron.bridge.models.mamba.mamba_builder import MambaModelConfig
++    from megatron.bridge.training.initialize import _create_pg_collection
++
++    mc = (
++        cfg.model.transformer
++        if isinstance(cfg.model, (GPTModelConfig, MambaModelConfig))
++        else cfg.model
++    )
++    saved = mc.context_parallel_size
++    mc.context_parallel_size = eval_cp_size
++    try:
++        return _create_pg_collection(
++            mc, num_distributed_optimizer_instances=cfg.ddp.num_distributed_optimizer_instances
++        )
++    finally:
++        mc.context_parallel_size = saved
+diff --git a/examples/zero_sm_pp/deepseek_mlperf/callback_logging.py b/examples/zero_sm_pp/deepseek_mlperf/callback_logging.py
+new file mode 100755
+index 000000000..395215fbe
+--- /dev/null
++++ b/examples/zero_sm_pp/deepseek_mlperf/callback_logging.py
+@@ -0,0 +1,348 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++
++import dataclasses
++import logging
++import os
++import time
++
++import numpy
++import torch
++from megatron.bridge.data.loaders import get_train_valid_test_num_samples
++from megatron.bridge.data.utils import get_dataset_provider
++from megatron.bridge.training.callbacks import Callback, CallbackContext
++from megatron.bridge.training.config import MockGPTDatasetConfig
++from megatron.core import parallel_state as mpu
++from megatron.core.full_cuda_graph import FullCudaGraphWrapper
++from megatron.core.inference.communication_utils import (
++    broadcast_from_last_pipeline_stage,
++)
++from mlperf_common.frameworks.pyt import PyTCommunicationHandler
++from mlperf_common.logging import MLLoggerWrapper
++
++from utils import get_rank
++
++logger = logging.getLogger(__name__)
++
++def get_last_pp_rank():
++    is_last_pp = mpu.is_pipeline_last_stage(ignore_virtual=True)
++    is_first_dp = mpu.get_data_parallel_rank() == 0
++    is_first_tp = mpu.get_tensor_model_parallel_rank() == 0
++    is_first_cp = mpu.get_context_parallel_rank() == 0
++    return is_last_pp and is_first_dp and is_first_tp and is_first_cp
++
++
++def broadcast_loss(loss_reduced):
++    if "lm loss" in loss_reduced:
++        loss_tensor = loss_reduced["lm loss"]
++    else:
++        loss_tensor = None
++
++    loss_synced = broadcast_from_last_pipeline_stage(
++        size=[1],
++        dtype=torch.float32,
++        tensor=loss_tensor.unsqueeze(0) if loss_tensor is not None else None,
++    )
++
++    return loss_synced.item()
++
++
++class DeltaTimer:
++    def __init__(self):
++        self.reset()
++
++    def reset(self):
++        self.start_time = time.perf_counter()
++        return self.start_time
++
++    def get_delta(self):
++        prev_time = self.start_time
++        return self.reset() - prev_time
++
++
++def _warm_npy_page_cache(datasets):
++    """Page-cache-warm the .npy index files on every rank.
++
++    After Phase 1 wrote the indices to path_to_cache on rank 0, only that
++    rank's OS page cache is hot. Other ranks would pay a cold mmap+read
++    during real dataset setup (first training step). Touching one element
++    per OS page forces a read without loading the whole file into memory.
++    Safe to run on every rank in parallel — pure local reads, no writes.
++
++    Load errors are allowed to propagate: fast_cache_load skips the runtime
++    os.path.isfile check, so this walk is the last validation gate before
++    run_start. A missing or corrupt file must fail here, not at the first
++    training batch when the MLPerf clock is already running.
++    """
++    stack = list(datasets) if isinstance(datasets, (list, tuple)) else [datasets]
++    seen = set()
++    while stack:
++        ds = stack.pop()
++        if ds is None:
++            continue
++        for attr in (
++            "path_to_document_index",
++            "path_to_sample_index",
++            "path_to_shuffle_index",
++            "path_to_dataset_index",
++            "path_to_dataset_sample_index",
++        ):
++            p = getattr(ds, attr, None)
++            if p and p not in seen:
++                seen.add(p)
++                arr = numpy.load(p, allow_pickle=True, mmap_mode="r")
++                if arr.size > 0:
++                    # reshape(-1) gives a zero-copy 1-D view of the C-contiguous
++                    # .npy buffer so striding is per-element, not per-row.
++                    # sample_index is 2-D (N, 2) int64; stepping the outer axis
++                    # with step=itemsize skips every other 4 KB page.
++                    flat = arr.reshape(-1)
++                    step = max(1, 4096 // max(flat.itemsize, 1))
++                    _ = flat[::step].sum()
++        sub = getattr(ds, "datasets", None)
++        if sub:
++            stack.extend(sub)
++
++
++mllogger = MLLoggerWrapper(PyTCommunicationHandler())
++
++
++class MLPerfLoggingCallback(Callback):
++    """MLPerf logging callback."""
++
++    def __init__(self, cfg):
++        self.cfg = cfg
++        self.global_batch_size = self.cfg.model.global_batch_size
++        self.train_block_started = False
++        self.train_block_samples_count = None
++        self.train_current_block = 0
++        self.force_success = cfg.custom.force_success_status
++
++    def on_data_init_start(self, context: CallbackContext):
++        # Prebuild dataset indices into path_to_cache before logging run_start
++        # so the index build does not count against MLPerf timing. Only reads
++        # .idx metadata (document count + sizes), never training tokens.
++        #
++        # Phase 1: rank 0 writes the .npy caches. Force defer=False so
++        # numpy.save runs, and fast_cache_load=False so the builder actually
++        # checks for files and writes them (fast_cache_load shortcuts
++        # cache_hit=True and skips the write path).
++        # Phase 2: every rank mmap-touches the caches so the OS page cache is
++        # warm before real dataset setup happens on the MLPerf clock. The
++        # real setup after run_start keeps the user-configured defer and
++        # fast_cache_load values (typically True/True) so it skips both the
++        # mmap open and the file-existence checks.
++        cfg = context.state.cfg
++        if isinstance(cfg.dataset, MockGPTDatasetConfig):
++            # Mock datasets generate synthetic data in memory — there are no
++            # .npy index files to prebuild or page-cache-warm.
++            mllogger.log_init_stop_run_start()
++            return
++        num_samples = get_train_valid_test_num_samples(cfg)
++
++        prebuild_cfg = dataclasses.replace(
++            cfg.dataset, defer_npy_index_mmap=False, fast_cache_load=False
++        )
++        get_dataset_provider(prebuild_cfg)(num_samples, prebuild_cfg)
++        torch.distributed.barrier()
++
++        touch_cfg = dataclasses.replace(cfg.dataset, defer_npy_index_mmap=True)
++        touch_datasets = get_dataset_provider(touch_cfg)(num_samples, touch_cfg)
++        _warm_npy_page_cache(touch_datasets)
++        torch.distributed.barrier()
++
++        mllogger.log_init_stop_run_start()
++
++    def on_train_start(self, context: CallbackContext):
++        context.state.should_stop = False
++        self._start_train_block(context.state)
++        self.timer = DeltaTimer()
++
++    def on_train_end(self, context: CallbackContext):
++        if self.train_block_started:
++            self._end_train_block(context.state)
++
++        FullCudaGraphWrapper.cuda_graph = None
++
++        # Synchronize all ranks after cleanup to prevent TCPStore shutdown race
++        if torch.distributed.is_initialized():
++            try:
++                torch.distributed.barrier()
++                if get_rank() == 0:
++                    logger.info("All ranks synchronized for teardown")
++            except Exception as e:
++                logger.warning(f"Barrier during teardown failed: {e}")
++
++    def on_eval_start(self, context: CallbackContext):
++        """Log validation start."""
++        if hasattr(context.state, "warmup") and context.state.warmup:
++            return
++        self.timer.reset()
++        if self.train_block_started:
++            self._end_train_block(context.state)
++
++        mllogger.start(
++            mllogger.constants.EVAL_START,
++            metadata={
++                mllogger.constants.SAMPLES_COUNT: self._get_samples_count(context.state),
++                "step": self._get_step(context.state),
++            },
++        )
++
++    def on_eval_end(self, context: CallbackContext):
++        if hasattr(context.state, "warmup") and context.state.warmup:
++            return
++        self._log_custom_timedelta("validation_time", self._get_step(context.state))
++
++        samples_count = self._get_samples_count(context.state)
++        if self.cfg.model.pipeline_model_parallel_size > 1:
++            loss = broadcast_loss(context.total_loss_dict)
++        else:
++            loss = context.total_loss_dict["lm loss"].item()
++
++        mllogger.event(
++            key=mllogger.constants.EVAL_ACCURACY,
++            metadata={mllogger.constants.SAMPLES_COUNT: samples_count},
++            value=loss,
++        )
++        mllogger.end(
++            mllogger.constants.EVAL_STOP,
++            metadata={
++                mllogger.constants.SAMPLES_COUNT: samples_count,
++                "step": self._get_step(context.state),
++            },
++        )
++
++        if loss < self.cfg.custom.target_log_ppl:
++            context.state.should_stop = True
++            mllogger.end(
++                mllogger.constants.RUN_STOP,
++                metadata={mllogger.constants.SAMPLES_COUNT: samples_count, "status": "success"},
++            )
++        elif context.state.train_state.step >= self.cfg.trainer.max_steps:
++            context.state.should_stop = True
++            status = "success" if self.force_success else "aborted"
++            mllogger.end(
++                mllogger.constants.RUN_STOP,
++                metadata={mllogger.constants.SAMPLES_COUNT: samples_count, "status": status},
++            )
++        if not os.environ.get("VAL_CHECK_INTERVAL"):
++            # If VAL_CHECK_INTERVAL is not set, we use the default schedule of 18432 sequences after skipping the first SKIP_EVALS evaluations
++            context.state.cfg.validation.eval_interval = self.cfg.trainer.val_check_interval
++
++        if not context.state.should_stop:
++            self._start_train_block(context.state)
++        else:
++            context.state.train_state.step = self.cfg.trainer.max_steps + 1
++            context.state.train_state.do_valid = False
++            context.state.train_state.do_test = False
++
++    def on_train_step_end(self, context: CallbackContext):
++        # train_state.step has not advanced to the completed step yet in this callback.
++        step = context.state.train_state.step + 1
++        last_step = step >= self.cfg.trainer.max_steps
++        eval_after_this_step = step % context.state.cfg.validation.eval_interval == 0
++        if last_step and not eval_after_this_step:
++            samples_count = step * self.global_batch_size
++            status = "success" if self.force_success else "aborted"
++            self._end_train_block(context.state, step=step)
++            mllogger.end(
++                mllogger.constants.RUN_STOP,
++                metadata={mllogger.constants.SAMPLES_COUNT: samples_count, "status": status},
++            )
++            self.train_block_started = False
++            context.state.should_stop = True
++            context.state.train_state.do_valid = False
++            context.state.train_state.do_test = False
++
++    def _start_train_block(self, global_state) -> None:
++        start_step = self._get_step(global_state)
++        remaining_steps = max(self.cfg.trainer.max_steps - start_step, 0)
++        block_steps = min(global_state.cfg.validation.eval_interval, remaining_steps)
++
++        self.train_block_started = True
++        self.train_block_samples_count = block_steps * self.global_batch_size
++        mllogger.start(
++            mllogger.constants.BLOCK_START,
++            metadata={
++                mllogger.constants.SAMPLES_COUNT: self.train_block_samples_count,
++                "step": start_step,
++            },
++        )
++
++    def _end_train_block(self, global_state, step=None) -> None:
++        assert self.train_block_samples_count is not None
++        if step is None:
++            step = self._get_step(global_state)
++        mllogger.end(
++            mllogger.constants.BLOCK_STOP,
++            metadata={
++                mllogger.constants.SAMPLES_COUNT: self.train_block_samples_count,
++                "step": step,
++            },
++        )
++        self.train_block_started = False
++        self.train_block_samples_count = None
++
++    def _log_custom_timedelta(self, value_key, step: int = 0):
++        mllogger.event(
++            key="tracked_stats",
++            metadata={"step": step},
++            value={value_key: self.timer.get_delta()},
++        )
++
++    def _get_step(self, global_state):
++        return global_state.train_state.step
++
++    def _get_samples_count(self, global_state):
++        return self._get_step(global_state) * self.global_batch_size
++
++
++class DeltaTimingCallback(Callback):
++    def __init__(self, cfg):
++        self.t0 = 0
++        self.total_train_step_time = [0, 0]
++        self.global_batch_size = cfg.model.global_batch_size
++        self.log_every_n_steps = cfg.trainer.log_every_n_steps
++
++    def on_train_start(self, context: CallbackContext):
++        self.t0 = time.time()
++
++    def on_train_step_end(self, context: CallbackContext):
++        t1 = time.time()
++        d = t1 - self.t0
++        self.total_train_step_time[0] += d
++        self.total_train_step_time[1] += 1
++        self.t0 = t1
++        if context.state.train_state.step == 4:
++            torch.cuda.cudart().cudaProfilerStart()
++        if context.state.train_state.step == 7:
++            torch.cuda.cudart().cudaProfilerStop()
++
++        if context.state.train_state.step % self.log_every_n_steps == 0 and get_last_pp_rank():
++            mllogger.event(
++                key="tracked_stats",
++                # +1 because train_state.step is 0-indexed at this point in the callback
++                metadata={mllogger.constants.SAMPLES_COUNT: self.global_batch_size * (context.state.train_state.step + 1)},
++                value={
++                    "train_step_time": d,
++                    "reduced_train_loss": context.loss_dict["lm loss"].item(),
++                },
++                unique=False,
++            )
++
++    def on_eval_end(self, context: CallbackContext):
++        """Reset timer after validation to avoid including validation time in first train step."""
++        self.t0 = time.time()
+diff --git a/examples/zero_sm_pp/deepseek_mlperf/callback_memory_profiler.py b/examples/zero_sm_pp/deepseek_mlperf/callback_memory_profiler.py
+new file mode 100755
+index 000000000..1eb096f38
+--- /dev/null
++++ b/examples/zero_sm_pp/deepseek_mlperf/callback_memory_profiler.py
+@@ -0,0 +1,194 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++
++import os
++import traceback
++from typing import List, Optional
++
++import torch
++from megatron.bridge.training.callbacks import Callback, CallbackContext
++from megatron.bridge.utils.common_utils import get_rank_safe, get_world_size_safe
++
++
++class MemoryProfileCallback(Callback):
++    """
++    Callback that starts/stops the PyTorch CUDA memory profiler and writes
++    snapshot pickle files. Supports step-based or phase-based (train_start/train_end)
++    profiling. On OOM or any exception during training, cleanup_after_oom() is
++    invoked so that memory snapshots and traceback are still written.
++
++    Snapshots can be viewed at https://pytorch.org/memory_viz (drag-and-drop the
++    .pickle file). If the visualizer shows nothing: (1) we now call
++    torch.cuda.synchronize() before dumping so the snapshot is consistent;
++    (2) ensure recording covered real training steps (start_step/end_step or
++    train_start/train_end); (3) try generating HTML locally from the same
++    PyTorch env: python -m torch.cuda._memory_viz trace_plot snapshot.pickle -o out.html
++    then open out.html in a browser.
++
++    Full-iteration CUDA graphs (FullCudaGraphWrapper):
++    - Replay steps do almost no Python-side allocation; tensor lifetimes are tied to
++      graph capture. Profiling ``start_step``/``end_step`` in the *middle* of training
++      therefore shows little allocator activity.
++    - Record allocations from **warmup/eager** iterations and from **graph capture**
++      (the step where ``curr_iteration == cuda_graph_warmup_steps``): use
++      ``start_step=None`` (begin at ``on_train_start``) and register this callback
++      *before* ``WarmupCallback`` (see ``pretrain.py``). Optionally set ``end_step``
++      to stop soon after capture so ``max_entries`` is not exhausted.
++    - Validation graph capture uses the same idea: ensure recording is already on
++      before the first eval that captures ``validation`` graph.
++    - If training stops before ``end_step``, the snapshot is still written at ``on_train_end``.
++
++    Env: ``MEMORY_PROFILE_START_STEP``, ``MEMORY_PROFILE_END_STEP`` (wired in ``model/671b.yaml``;
++    set them in ``config_performance_profile.sh`` or the shell).
++    """
++
++    def __init__(
++        self,
++        enabled: bool = True,
++        file_prefix: str = "memdump",
++        output_dir: str = "/mem_dump",
++        max_entries: int = 1000000,
++        rank_0_only: bool = True,
++        profile_ranks: Optional[List[int]] = None,
++        start_step: Optional[int] = None,
++        end_step: Optional[int] = None,
++        force_oom_before_stop: bool = False,
++    ):
++        self.enabled = enabled
++        self.file_prefix = file_prefix
++        self.output_dir = output_dir
++        self.max_entries = max_entries
++        self.force_oom_before_stop = force_oom_before_stop
++        self.start_step = start_step  # None = start at train_start
++        self.end_step = end_step  # None = stop at train_end
++
++        global_rank = get_rank_safe()
++        world_size = get_world_size_safe()
++        if profile_ranks is not None:
++            ranks = profile_ranks
++        else:
++            ranks = [0] if rank_0_only else list(range(world_size))
++        self.do_profile = enabled and (global_rank in ranks)
++        self._rank = global_rank
++
++        self._recording = False
++
++    @staticmethod
++    def _format_bytes(b: int) -> str:
++        """Format byte count as human-readable string (e.g. 1.23 GiB)."""
++        if b >= 1024**3:
++            return f"{b / 1024**3:.2f} GiB"
++        if b >= 1024**2:
++            return f"{b / 1024**2:.2f} MiB"
++        return f"{b} B"
++
++    def _log_step_memory(self, step: int, label: str) -> None:
++        """Print current GPU memory allocated (and reserved) for this rank."""
++        try:
++            torch.cuda.synchronize()
++            allocated = torch.cuda.memory_allocated()
++            reserved = torch.cuda.memory_reserved()
++            max_allocated = torch.cuda.max_memory_allocated()
++            max_reserved = torch.cuda.max_memory_reserved()
++            print_str = f"Rank {self._rank} step {step} {label}: \
++            Allocated: {self._format_bytes(allocated)} \
++            Reserved: {self._format_bytes(reserved)} \
++            Max Allocated: {self._format_bytes(max_allocated)} \
++            Max Reserved: {self._format_bytes(max_reserved)}"
++            print(print_str, flush=True)
++        except Exception:
++            pass
++
++    def _start_recording(self) -> None:
++        if not self.do_profile or self._recording:
++            return
++        torch.cuda.memory._record_memory_history(max_entries=self.max_entries)
++        self._recording = True
++
++    def _stop_and_dump(self, suffix: str = "") -> None:
++        if not self.do_profile or not self._recording:
++            return
++        try:
++            if self.force_oom_before_stop:
++                self._force_oom()
++            os.makedirs(self.output_dir, exist_ok=True)
++            filename = os.path.join(self.output_dir, f"{self.file_prefix}_{self._rank}{suffix}.pickle")
++            # Synchronize so pending CUDA ops are reflected in the snapshot (required for a
++            # valid timeline in the memory visualizer at https://pytorch.org/memory_viz).
++            torch.cuda.synchronize()
++            torch.cuda.memory._dump_snapshot(filename)
++        finally:
++            try:
++                torch.cuda.memory._record_memory_history(enabled=None)
++            except Exception:
++                pass
++            self._recording = False
++
++    def _force_oom(self) -> None:
++        """Trigger an OOM for debugging (e.g. to capture allocator state)."""
++        try:
++            torch.cuda.empty_cache()
++            _ = torch.empty(2**32, device="cuda", dtype=torch.uint8)
++        except Exception:
++            pass
++
++    def cleanup_after_oom(self) -> None:
++        """
++        Write memory snapshot and traceback after OOM or any crash.
++        Should be called from an external exception handler wrapping the training loop.
++        """
++        if not self.do_profile:
++            return
++        try:
++            os.makedirs(self.output_dir, exist_ok=True)
++            memdump_filename = os.path.join(self.output_dir, f"{self.file_prefix}_failed_{self._rank}.pickle")
++            traceback_filename = os.path.join(self.output_dir, f"{self.file_prefix}_failed_{self._rank}.traceback")
++            with open(traceback_filename, "w") as f:
++                traceback.print_exc(file=f)
++            if self._recording:
++                try:
++                    torch.cuda.synchronize()
++                except Exception:
++                    pass
++                torch.cuda.memory._dump_snapshot(memdump_filename)
++            try:
++                torch.cuda.memory._record_memory_history(enabled=None)
++            except Exception:
++                pass
++            self._recording = False
++        except Exception:
++            pass
++
++    def on_train_start(self, context: CallbackContext) -> None:
++        if self.start_step is None:
++            self._start_recording()
++
++    def on_train_end(self, context: CallbackContext) -> None:
++        # Dump when: (1) profiling through full training (end_step unset), or (2) run ended
++        # before MEMORY_PROFILE_END_STEP — otherwise we would never write a snapshot.
++        if self.end_step is None or self._recording:
++            self._stop_and_dump()
++
++    def on_train_step_start(self, context: CallbackContext) -> None:
++        step = context.state.train_state.step
++        self._log_step_memory(step, "start")
++        if self.start_step is not None and step == self.start_step:
++            self._start_recording()
++
++    def on_train_step_end(self, context: CallbackContext) -> None:
++        step = context.state.train_state.step
++        if self.end_step is not None and step == self.end_step:
++            self._stop_and_dump()
++        self._log_step_memory(step, "end")
+diff --git a/examples/zero_sm_pp/deepseek_mlperf/callback_warmup.py b/examples/zero_sm_pp/deepseek_mlperf/callback_warmup.py
+new file mode 100755
+index 000000000..adb131211
+--- /dev/null
++++ b/examples/zero_sm_pp/deepseek_mlperf/callback_warmup.py
+@@ -0,0 +1,599 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import logging
++import os
++import time
++from contextlib import nullcontext
++from pprint import pprint
++
++import torch
++from callback_eval_cp import EvalCPCallback
++from megatron.bridge.data.samplers import build_pretraining_data_loader
++from megatron.bridge.training import eval as eval_module
++from megatron.bridge.training import train as train_module
++from megatron.bridge.training.callbacks import Callback, CallbackContext
++from megatron.bridge.training.tokenizers.config import TokenizerConfig
++from megatron.bridge.training.tokenizers.tokenizer import build_tokenizer
++from megatron.bridge.training.utils.pg_utils import get_pg_collection
++from megatron.bridge.training.utils.train_utils import prepare_forward_step_func
++from megatron.bridge.utils.cuda_graph import is_full_iteration_cuda_graph
++from megatron.core import parallel_state
++from megatron.core.transformer.moe.moe_utils import reduce_aux_losses_tracker_across_ranks
++from megatron.core.datasets.blended_megatron_dataset_builder import (
++    BlendedMegatronDatasetBuilder,
++)
++from megatron.core.datasets.gpt_dataset import MockGPTDataset
++from megatron.core.full_cuda_graph import FullCudaGraphWrapper, get_graph_pool, get_shared_capture_stream
++from megatron.core.num_microbatches_calculator import get_num_microbatches
++from megatron.core.pipeline_parallel import get_forward_backward_func
++from megatron.core.pipeline_parallel.p2p_communication import P2PCommunicator
++from megatron.core.transformer.cuda_graphs import TECudaGraphHelper
++from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
++from megatron.core.utils import get_model_config
++
++try:
++    from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
++except ImportError:
++    OptimizerCudaGraphWrapper = None  # type: ignore[misc, assignment]
++from utils import get_rank
++
++logger = logging.getLogger(__name__)
++
++
++def _reset_param_gather_dispatched(model):
++    for model_chunk in model:
++        for bucket_group in model_chunk.bucket_groups + model_chunk.expert_parallel_bucket_groups:
++            bucket_group.param_gather_dispatched = False
++
++
++def _copy_main_params_to_param_buffer(optimizer):
++    for optim_instance in optimizer.chained_optimizers:
++        if isinstance(optim_instance, DistributedOptimizer):
++            optim_instance._copy_main_params_to_param_buffer()
++
++
++def _zero_and_copy_main_params_to_param_buffer(model, optimizer):
++    for model_chunk in model:
++        model_chunk.zero_grad_buffer()
++    _copy_main_params_to_param_buffer(optimizer)
++
++
++def _handle_mxfp8_param_buffer_copy_skip_training_cg(
++    optimizer,
++    model,
++    reuse_grad_buf_for_mxfp8_param_ag,
++    overlap_param_gather,
++):
++    """Replaces train_module._handle_mxfp8_param_buffer_copy.
++
++    When skip_training_cg_param_ag is on, the param AG is omitted at CG
++    capture, so the buffer doesn't need re-populating once the graph is
++    captured — eval's force-sync keeps param.data correct. Behavior
++    matches upstream when the flag is off.
++    """
++    if not (reuse_grad_buf_for_mxfp8_param_ag and overlap_param_gather):
++        return
++
++    forward_pre_hook_enabled = len(model[0].remove_forward_pre_hook_handles) > 0
++    full_cg_captured = FullCudaGraphWrapper.cuda_graph.get("training") is not None
++    model_config = get_model_config(model[0])
++    skip_training_cg_param_ag = bool(
++        getattr(model_config, "skip_training_cg_param_ag", False)
++    )
++
++    if skip_training_cg_param_ag:
++        should_copy_main_params = forward_pre_hook_enabled and not full_cg_captured
++    else:
++        should_copy_main_params = forward_pre_hook_enabled or full_cg_captured
++
++    if should_copy_main_params:
++        _copy_main_params_to_param_buffer(optimizer)
++
++
++_handle_mxfp8_param_buffer_copy_skip_training_cg._skip_training_cg_param_ag_patch = True
++if not getattr(
++    train_module._handle_mxfp8_param_buffer_copy,
++    "_skip_training_cg_param_ag_patch",
++    False,
++):
++    train_module._handle_mxfp8_param_buffer_copy = (
++        _handle_mxfp8_param_buffer_copy_skip_training_cg
++    )
++
++
++# Guard TECudaGraphHelper.delete_cuda_graphs against Bridge's ghost helper:
++# Bridge's train.py builds its own TECudaGraphHelper when cuda_graph_impl ==
++# "transformer_engine" but never captures on it (our WarmupCallback already did).
++# MBridge #3459 (2026-04-22) made delete_cuda_graphs assert _graphs_created, which
++# fires at teardown. Short-circuit the delete when no graphs were created.
++_orig_te_delete_cuda_graphs = TECudaGraphHelper.delete_cuda_graphs
++
++
++def _guarded_te_delete_cuda_graphs(self):
++    if not self._graphs_created:
++        return
++    return _orig_te_delete_cuda_graphs(self)
++
++
++TECudaGraphHelper.delete_cuda_graphs = _guarded_te_delete_cuda_graphs
++
++
++def create_mock_dataset_config(config):
++    from megatron.bridge.training.config import MockGPTDatasetConfig
++
++    vocab_size = 129280  # DeepSeek-V3 tokenizer vocab size
++    tokenizer = build_tokenizer(
++        config=TokenizerConfig(tokenizer_type="NullTokenizer", vocab_size=vocab_size),
++        make_vocab_size_divisible_by=128,
++        tensor_model_parallel_size=1,
++    )
++
++    mock_config = MockGPTDatasetConfig(
++        seq_length=config.model.encoder_seq_length,
++        random_seed=config.model.seed,
++        dataloader_type="single",
++        num_workers=config.data.num_workers,
++        reset_position_ids=False,
++        reset_attention_mask=False,
++        eod_mask_loss=False,
++        path_to_cache=None,
++        split="900,50,50",
++        data_sharding=True,
++        create_attention_mask=False,
++    )
++    mock_config.tokenizer = tokenizer
++
++    return mock_config
++
++
++def capture_te_cuda_graph(context, model_config):
++    """Capture TE CUDA graphs.
++
++    The caller is responsible for managing forward pre-hook and param_sync_func
++    state around this call — hooks should be disabled and param_sync_func should
++    be None so that collectives are not baked into the captured graph.
++
++    Returns the TECudaGraphHelper so the caller can set manual hooks after
++    re-enabling forward pre-hooks.
++    """
++    cuda_graph_helper = TECudaGraphHelper(
++        model=context.model,
++        config=model_config,
++        seq_length=context.state.cfg.model.seq_length,
++        micro_batch_size=context.state.cfg.train.micro_batch_size,
++        optimizers=[context.optimizer],
++    )
++
++    cuda_graph_helper.create_cudagraphs()
++
++    # Prevent train.py from ever re-capturing
++    model_config.cuda_graph_warmup_steps = -1
++    return cuda_graph_helper
++
++
++
++def _ntrace_cuda_graph_capture_window(name):
++    try:
++        from ntrace import cuda_graph_capture_window
++    except Exception:
++        return nullcontext()
++    return cuda_graph_capture_window(name)
++
++
++def _profile_cuda_graph_capture_enabled():
++    if os.environ.get("PROFILE_CUDA_GRAPH_CAPTURE", "0") != "1":
++        return False
++    ranks_str = os.environ.get("PROFILE_RANKS", "0")
++    profile_ranks = [int(x.strip()) for x in ranks_str.split(",") if x.strip()]
++    return torch.distributed.get_rank() in profile_ranks
++
++
++def _profile_cuda_graph_capture_end_step():
++    return int(os.environ.get("PROFILE_END_STEP", "2"))
++
++
++class WarmupOptimizerCudaGraphWrapper(OptimizerCudaGraphWrapper):
++    def __init__(self, optimizer_step_func, cuda_graph_warmup_steps, use_single_mempool):
++        self.optimizer_step_func = optimizer_step_func
++        self.cuda_graph_warmup_steps = cuda_graph_warmup_steps
++        self.use_single_mempool = use_single_mempool
++
++    def __call__(self, *args, **kwargs):
++        assert len(args) == 0, 'optimizer.step() does not accept positional args'
++        assert len(kwargs) == 0, 'optimizer.step() does not accept keyword args'
++        curr_iteration = OptimizerCudaGraphWrapper.curr_iteration
++        if curr_iteration < self.cuda_graph_warmup_steps:
++            OptimizerCudaGraphWrapper.result = self.optimizer_step_func()
++            OptimizerCudaGraphWrapper.curr_iteration += 1
++        return OptimizerCudaGraphWrapper.result
++
++    def capture_cuda_graph(self):
++        torch.distributed.barrier()
++        assert OptimizerCudaGraphWrapper.cuda_graph is None
++        OptimizerCudaGraphWrapper.cuda_graph = torch.cuda.CUDAGraph()
++        torch.cuda.synchronize()
++        capture_stream = get_shared_capture_stream()
++        logger.info(f'WarmupOptimizerCudaGraphWrapper: Capture Optimizer CUDA graph!!!')
++        with torch.cuda.graph(
++            OptimizerCudaGraphWrapper.cuda_graph,
++            stream=capture_stream,
++            pool=get_graph_pool(self.use_single_mempool),
++        ):
++            OptimizerCudaGraphWrapper.result = self.optimizer_step_func()
++        torch.cuda.synchronize()
++        torch.distributed.barrier()
++        logger.info(f'Optimizer CUDA graph capture done!!!')
++
++
++class WarmupCallback(Callback):
++    def __init__(self, cfg, forward_step_func=None):
++        self.cfg = cfg
++        self.forward_step_func = forward_step_func
++        self.train_steps = cfg.trainer.warmup_train_steps
++        self.val_steps = cfg.trainer.warmup_validation_steps
++        self.cg_warmup_steps = cfg.model.cuda_graph_warmup_steps
++        self.optimizer_cuda_graph = cfg.optim.optimizer_cuda_graph
++        self.cuda_graph_helper = None
++        self._cuda_profiler_started = False
++        self._cuda_profiler_stopped = False
++
++    def _start_cuda_profiler_for_capture(self):
++        if self._cuda_profiler_started or not _profile_cuda_graph_capture_enabled():
++            return
++        torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStart())
++        self._cuda_profiler_started = True
++
++    def on_train_step_end(self, context: CallbackContext):
++        if not self._cuda_profiler_started or self._cuda_profiler_stopped:
++            return
++        if context.state.train_state.step != _profile_cuda_graph_capture_end_step():
++            return
++        torch.cuda.check_error(torch.cuda.cudart().cudaProfilerStop())
++        self._cuda_profiler_stopped = True
++
++    def on_data_init_start(self, context: CallbackContext):
++        torch.cuda.synchronize()
++        torch.distributed.barrier()
++        if get_rank() == 0:
++            print("\nMCore config:", flush=True)
++            pprint(context.model[0].config)
++
++        torch.distributed.barrier()
++        pg_collection = get_pg_collection(context.model)
++        model_config = get_model_config(context.model[0])
++
++        forward_backward_func = get_forward_backward_func(
++            pp_size=pg_collection.pp.size(),
++            vp_size=context.state.cfg.model.virtual_pipeline_model_parallel_size,
++        )
++
++        if is_full_iteration_cuda_graph(model_config):
++            forward_backward_func = FullCudaGraphWrapper(
++                forward_backward_func,
++                cuda_graph_warmup_steps=self.cg_warmup_steps,
++                use_single_mempool=context.state.cfg.model.cuda_graph_use_single_mempool,
++            )
++            skip_training_cg_param_ag = (
++                bool(self.cfg.optim.skip_training_cg_param_ag)
++                and context.state.cfg.validation.eval_interval == 1
++            )
++        else:
++            skip_training_cg_param_ag = False
++        if context.state.cfg.optimizer.optimizer_cuda_graph:
++            context.optimizer.step = WarmupOptimizerCudaGraphWrapper(
++                context.optimizer.step,
++                cuda_graph_warmup_steps=-1,
++                use_single_mempool=context.state.cfg.model.cuda_graph_use_single_mempool,
++            )
++        model_config.skip_training_cg_param_ag = skip_training_cg_param_ag
++
++        prepared_forward_step_func = prepare_forward_step_func(self.forward_step_func, context.state)
++
++        # Create and finalize mock dataset config
++        mock_config = create_mock_dataset_config(self.cfg)
++        mock_config.finalize()
++
++        # Calculate number of samples needed for warmup
++        micro_batch_size = self.cfg.model.micro_batch_size
++        num_microbatches = get_num_microbatches()
++        dp_size = parallel_state.get_data_parallel_world_size()
++
++        # Samples needed: (steps * microbatches * micro_batch_size * dp_size)
++        train_samples = self.train_steps * num_microbatches * micro_batch_size * dp_size
++        # Validation runs at the eval-DP topology when EvalCPCallback is active
++        # (otherwise train DP). Sample count and sampler indices must match.
++        eval_cp_cb = EvalCPCallback.get_active()
++        if eval_cp_cb is not None and eval_cp_cb.eval_dp_group is not None:
++            val_dp_rank = torch.distributed.get_rank(eval_cp_cb.eval_dp_group)
++            val_dp_size = torch.distributed.get_world_size(eval_cp_cb.eval_dp_group)
++        else:
++            val_dp_rank = parallel_state.get_data_parallel_rank()
++            val_dp_size = dp_size
++        # Use training num_microbatches for validation dataset sizing: the pipeline
++        # scheduler consumes data at the training rate regardless of eval_batch_size.
++        val_samples = self.val_steps * num_microbatches * micro_batch_size * val_dp_size
++
++        def _build_iterator(num_samples, dp_rank, dp_size_):
++            ds, _, _ = BlendedMegatronDatasetBuilder(
++                MockGPTDataset,
++                [num_samples, 0, 0],
++                lambda: True,  # is_dataset_built_on_rank - always True for mock
++                mock_config,
++            ).build()
++            return iter(build_pretraining_data_loader(
++                dataset=ds,
++                consumed_samples=0,
++                dataloader_type=mock_config.dataloader_type or "single",
++                micro_batch_size=micro_batch_size,
++                num_workers=mock_config.num_workers,
++                data_sharding=mock_config.data_sharding,
++                data_parallel_rank=dp_rank,
++                data_parallel_size=dp_size_,
++            ))
++
++        data_iterator = _build_iterator(train_samples, parallel_state.get_data_parallel_rank(), dp_size)
++        val_data_iterator = (
++            _build_iterator(val_samples, val_dp_rank, val_dp_size) if self.val_steps > 0 else None
++        )
++
++        # Initialize pp group in warmup.
++        pp_group = pg_collection.pp
++        p2p_communicator = P2PCommunicator(pp_group=pp_group, config=model_config)
++        torch.distributed.barrier(pp_group)
++
++        # Mirror train.py: disable forward pre-hooks during warmup to prevent
++        # stale data from propagating through the first all-gather.
++        should_toggle_fwd_pre_hook = train_module.should_disable_forward_pre_hook(
++            context.state.cfg.ddp.use_megatron_fsdp,
++            context.state.cfg.optimizer.use_distributed_optimizer,
++            context.state.cfg.ddp.overlap_param_gather,
++        )
++        if should_toggle_fwd_pre_hook:
++            train_module.disable_forward_pre_hook(context.model, param_sync=False)
++            param_sync_func = model_config.param_sync_func
++            model_config.param_sync_func = None
++
++        for group in context.optimizer.param_groups:
++            group["betas_"] = group["betas"]
++            group["bias_correction_"] = group["bias_correction"]
++            group["lr_"] = group["lr"]
++            group["weight_decay_"] = group["weight_decay"]
++            group["betas"] = [1.0, 1.0]
++            group["bias_correction"] = False
++            group["lr"] = 0.0 if not self.optimizer_cuda_graph else torch.zeros_like(group["lr_"])
++            group["weight_decay"] = 0.0
++
++        # Warmup for training
++        scheduler_state = context.scheduler.state_dict()
++
++        # OptimizerCudaGraphWrapper captures when curr_iteration == cuda_graph_warmup_steps
++        # (megatron training.train). This callback runs extra train_steps optimizer steps
++        # first; ensure the capture iteration is past callback warmup (curr reaches
++        # train_steps before real training, so threshold must be > train_steps - 1).
++        if OptimizerCudaGraphWrapper is not None and isinstance(
++            context.optimizer.step, OptimizerCudaGraphWrapper
++        ):
++            wrapped_optimizer_step = context.optimizer.step
++            prev_cuda_graph_warmup_steps = wrapped_optimizer_step.cuda_graph_warmup_steps
++            wrapped_optimizer_step.cuda_graph_warmup_steps = max(
++                prev_cuda_graph_warmup_steps,
++                self.train_steps + 1,
++            )
++            if torch.distributed.get_rank() == 0:
++                logger.info(
++                    f"Extended optimizer CUDA graph warmup steps from "
++                    f"{prev_cuda_graph_warmup_steps} to "
++                    f"{wrapped_optimizer_step.cuda_graph_warmup_steps}"
++                )
++
++        if torch.distributed.get_rank() == 0:
++            logger.info("Starting training warmup")
++        start = time.time()
++        for step_idx in range(self.train_steps):
++            if torch.distributed.get_rank() == 0:
++                logger.info(f"    Starting warmup step {step_idx}")
++                step_timer = time.time()
++
++            capture_full_cg_this_step = (
++                is_full_iteration_cuda_graph(model_config)
++                and FullCudaGraphWrapper.cuda_graph.get("training") is None
++                and FullCudaGraphWrapper.curr_iteration.get("training", 0) == self.cg_warmup_steps
++            )
++            capture_training_cg_this_step = (
++                capture_full_cg_this_step
++                and skip_training_cg_param_ag
++                and should_toggle_fwd_pre_hook
++            )
++            disabled_forward_pre_hook_for_capture = False
++            if capture_training_cg_this_step:
++                # Disable the param AG so it isn't baked into the captured
++                # graph — eval's AG'ed weights are reused at replay.
++                if len(context.model[0].remove_forward_pre_hook_handles) > 0:
++                    train_module.disable_forward_pre_hook(context.model, param_sync=False)
++                    disabled_forward_pre_hook_for_capture = True
++                model_config.param_sync_func = None
++
++            torch.cuda.synchronize()
++            torch.distributed.barrier()
++            if capture_full_cg_this_step:
++                self._start_cuda_profiler_for_capture()
++            graph_capture_context = (
++                _ntrace_cuda_graph_capture_window("full_iteration_cuda_graph")
++                if capture_full_cg_this_step
++                else nullcontext()
++            )
++            with graph_capture_context:
++                train_module.train_step(
++                    forward_step_func=prepared_forward_step_func,
++                    data_iterator=data_iterator,
++                    model=context.model,
++                    optimizer=context.optimizer,
++                    scheduler=context.scheduler,
++                    global_state=context.state,
++                    pg_collection=pg_collection,
++                    forward_backward_func=forward_backward_func,
++                    p2p_communicator=p2p_communicator,
++                )
++            # Initialize NCCL comms for MoE aux-loss reduce groups, same as training_log does.
++            reduce_aux_losses_tracker_across_ranks(pg_collection=pg_collection)
++
++            if step_idx == 0:
++                # Capture TE CUDA graphs while hooks are still disabled and
++                # param_sync_func is None (mirrors train.py L345 where
++                # capture happens before hook enable at L438).
++                if context.state.cfg.model.cuda_graph_impl == "transformer_engine":
++                    self._start_cuda_profiler_for_capture()
++                    with _ntrace_cuda_graph_capture_window("transformer_engine_cuda_graph"):
++                        self.cuda_graph_helper = capture_te_cuda_graph(context, model_config)
++                # Enable forward pre-hooks after the first warmup step, matching
++                # the normal train.py behavior. Local full-iteration CUDA graph
++                # capture disables parameter gather only for the capture step.
++                if should_toggle_fwd_pre_hook:
++                    train_module.enable_forward_pre_hook(context.model)
++                    model_config.param_sync_func = param_sync_func
++                    if self.cuda_graph_helper is not None:
++                        self.cuda_graph_helper.cuda_graph_set_manual_hooks()
++
++            if capture_training_cg_this_step:
++                if disabled_forward_pre_hook_for_capture:
++                    train_module.enable_forward_pre_hook(context.model)
++                model_config.param_sync_func = param_sync_func
++
++            torch.cuda.synchronize()
++            torch.distributed.barrier()
++            if torch.distributed.get_rank() == 0:
++                logger.info(f"    Finished warmup step {step_idx}, takes {time.time() - step_timer} s")
++
++        if hasattr(context.scheduler, "num_steps"):
++            context.scheduler.num_steps = 0
++        context.scheduler.load_state_dict(scheduler_state)
++
++        torch.cuda.synchronize()
++        torch.distributed.barrier()
++        if torch.distributed.get_rank() == 0:
++            logger.info(f"Finished training warmup: {time.time() - start} s. ")
++
++        # Recover optimizer configs changed by warmup
++        for group in context.optimizer.param_groups:
++            group["betas"] = group["betas_"]
++            group["bias_correction"] = group["bias_correction_"]
++            group["lr"] = group["lr_"]
++            group["weight_decay"] = group["weight_decay_"]
++            del group["betas_"]
++            del group["bias_correction_"]
++            del group["lr_"]
++            del group["weight_decay_"]
++            if "step" in group:
++                # MegatronFusedAdam
++                if isinstance(group["step"], torch.Tensor):
++                    group["step"].fill_(1)
++                else:
++                    group["step"] = 1
++
++        # Capture Optimizer CUDA graph but don't replay it
++        if context.state.cfg.optimizer.optimizer_cuda_graph:
++            assert isinstance(context.optimizer.step, OptimizerCudaGraphWrapper)
++            context.optimizer.step.capture_cuda_graph()
++        # If no training steps ran, hooks are still disabled — enable now.
++        if should_toggle_fwd_pre_hook and self.train_steps == 0:
++            train_module.enable_forward_pre_hook(context.model)
++            model_config.param_sync_func = param_sync_func
++
++        if self.val_steps > 0:
++            start_val_time = time.time()
++            if torch.distributed.get_rank() == 0:
++                logger.info("Starting validation warmups")
++            original_eval_iters = context.state.cfg.validation.eval_iters
++            context.state.cfg.validation.eval_iters = self.val_steps
++
++            # Populate param_data with correct param shards before validation so that
++            # finish_param_sync (triggered by forward pre-hooks) all-gathers actual
++            # weights instead of stale gradient data left over from the training step.
++            # This mirrors the _handle_mxfp8_param_buffer_copy() call in train_step.
++            if (
++                context.state.cfg.optimizer.reuse_grad_buf_for_mxfp8_param_ag
++                and context.state.cfg.ddp.overlap_param_gather
++            ):
++                _zero_and_copy_main_params_to_param_buffer(context.model, context.optimizer)
++
++            # Disable hooks before validation, mirroring train.py L517-518.
++            if should_toggle_fwd_pre_hook:
++                train_module.disable_forward_pre_hook(context.model)
++
++            torch.cuda.synchronize()
++            torch.distributed.barrier()
++            # When EvalCPCallback is active, swap CP topology around the bare
++            # evaluate() call (it bypasses on_eval_start/end via callback hooks).
++            eval_ctx = (
++                eval_cp_cb.eval_topology(context.model) if eval_cp_cb is not None else nullcontext()
++            )
++            with eval_ctx:
++                eval_module.evaluate(
++                    context.state,
++                    prepared_forward_step_func,
++                    val_data_iterator,
++                    context.model,
++                    None,
++                    context.state.cfg,
++                    False,
++                )
++
++            context.state.train_state.consumed_valid_samples = 0
++            context.state.cfg.validation.eval_iters = original_eval_iters
++
++            # Re-enable hooks after validation, mirroring train.py L543-545.
++            if should_toggle_fwd_pre_hook:
++                train_module.enable_forward_pre_hook(context.model)
++
++            torch.cuda.synchronize()
++            torch.distributed.barrier()
++            if torch.distributed.get_rank() == 0:
++                logger.info(f"Finished validation warmup: {time.time() - start_val_time} s. ")
++
++        if (
++            is_full_iteration_cuda_graph(model_config)
++            and FullCudaGraphWrapper.cuda_graph.get("training") is not None
++        ):
++            # The warmup callback captured the full-CG already. Keep the real
++            # train/eval loops on replay; otherwise their wrappers try to
++            # capture again and trip the MCore "graph must be None" assert.
++            # MCore captures when curr_iteration == cuda_graph_warmup_steps;
++            # -1 is unreachable for the post-warmup train/eval loops.
++            model_config.cuda_graph_warmup_steps = -1
++
++        torch.cuda.synchronize()
++        torch.distributed.barrier()
++        if torch.distributed.get_rank() == 0:
++            logger.info(f"Time spent in run_training_warmup: {time.time() - start}s")
++
++    def on_train_end(self, context: CallbackContext):
++        # Release TE CUDA graphs captured during warmup. delete_cuda_graphs()
++        # iterates callables_per_chunk, resets each graph, and clears
++        # layer.cuda_graphs itself — a preceding manual loop would delete the
++        # attribute and cause AttributeError inside delete_cuda_graphs().
++        if self.cuda_graph_helper is None:
++            return
++        self.cuda_graph_helper.delete_cuda_graphs()
++        self.cuda_graph_helper = None
++
++    def on_eval_start(self, context: CallbackContext):
++        # train.py already populated param_data and forced eval param sync before
++        # eval callbacks run. Only clear the stale dispatch flag left by that
++        # force-sync so any later hook-driven path can dispatch normally.
++        if (
++            context.state.cfg.optimizer.reuse_grad_buf_for_mxfp8_param_ag
++            and context.state.cfg.ddp.overlap_param_gather
++        ):
++            _reset_param_gather_dispatched(context.model)
+diff --git a/examples/zero_sm_pp/deepseek_mlperf/conf/data_prefix/benchmark_c4.yaml b/examples/zero_sm_pp/deepseek_mlperf/conf/data_prefix/benchmark_c4.yaml
+new file mode 100755
+index 000000000..8f571abda
+--- /dev/null
++++ b/examples/zero_sm_pp/deepseek_mlperf/conf/data_prefix/benchmark_c4.yaml
+@@ -0,0 +1,9 @@
++train:                                                        
++  - 0.5                                                         
++  - /preproc_data/c4_en_6_c4_spm_text_document                  
++  - 0.5                                                         
++  - /preproc_data/c4_en_7_c4_spm_text_document                  
++validation:                                                   
++  - /preproc_data/c4_en_validation_subset_c4_spm_text_document  
++test:                                                         
++  - /preproc_data/c4_en_validation_subset_c4_spm_text_document  
+diff --git a/examples/zero_sm_pp/deepseek_mlperf/conf/data_prefix/full_c4.yaml b/examples/zero_sm_pp/deepseek_mlperf/conf/data_prefix/full_c4.yaml
+new file mode 100755
+index 000000000..45dc39217
+--- /dev/null
++++ b/examples/zero_sm_pp/deepseek_mlperf/conf/data_prefix/full_c4.yaml
+@@ -0,0 +1,16 @@
++- 0.125
++- /preproc_data/c4_en_0_c4_spm_text_document
++- 0.125
++- /preproc_data/c4_en_1_c4_spm_text_document
++- 0.125
++- /preproc_data/c4_en_2_c4_spm_text_document
++- 0.125
++- /preproc_data/c4_en_3_c4_spm_text_document
++- 0.125
++- /preproc_data/c4_en_4_c4_spm_text_document
++- 0.125
++- /preproc_data/c4_en_5_c4_spm_text_document
++- 0.125
++- /preproc_data/c4_en_6_c4_spm_text_document
++- 0.125
++- /preproc_data/c4_en_7_c4_spm_text_document
+diff --git a/examples/zero_sm_pp/deepseek_mlperf/conf/data_prefix/synthetic.yaml b/examples/zero_sm_pp/deepseek_mlperf/conf/data_prefix/synthetic.yaml
+new file mode 100755
+index 000000000..8b1378917
+--- /dev/null
++++ b/examples/zero_sm_pp/deepseek_mlperf/conf/data_prefix/synthetic.yaml
+@@ -0,0 +1 @@
++
+diff --git a/examples/zero_sm_pp/deepseek_mlperf/conf/data_prefix/train_only_c4.yaml b/examples/zero_sm_pp/deepseek_mlperf/conf/data_prefix/train_only_c4.yaml
+new file mode 100755
+index 000000000..52a8798f6
+--- /dev/null
++++ b/examples/zero_sm_pp/deepseek_mlperf/conf/data_prefix/train_only_c4.yaml
+@@ -0,0 +1,4 @@
++- 0.5
++- /preproc_data/c4_en_6_c4_spm_text_document"
++- 0.5
++- /preproc_data/c4_en_7_c4_spm_text_document"
+diff --git a/examples/zero_sm_pp/deepseek_mlperf/conf/deepseekv3_671b.yaml b/examples/zero_sm_pp/deepseek_mlperf/conf/deepseekv3_671b.yaml
+new file mode 100755
+index 000000000..aeae29516
+--- /dev/null
++++ b/examples/zero_sm_pp/deepseek_mlperf/conf/deepseekv3_671b.yaml
+@@ -0,0 +1,88 @@
++defaults:
++  - _self_
++  - model: ${oc.decode:${oc.env:MODEL_SIZE,671b}}
++  - data_prefix@data.data_prefix: benchmark_c4
++  - override hydra/job_logging: stdout
++
++hydra:
++  run:
++    dir: '.'
++  output_subdir: null
++
++
++trainer:
++  devices: ${oc.decode:${oc.env:DGXNGPU,8}}
++  num_nodes: ${oc.decode:${oc.env:DGXNNODES,1}}
++  max_steps: ${oc.decode:${oc.env:MAX_STEPS,${ceil_div:1382400000,${model.global_batch_size}}}}
++  log_every_n_steps: ${oc.decode:${oc.env:LOG_EVERY_N_STEPS,1}}
++
++  val_check_interval: ${oc.decode:${oc.env:VAL_CHECK_INTERVAL,${ceil_div:24576,${model.global_batch_size}}}}
++  limit_val_batches: ${oc.decode:${oc.env:LIMIT_VAL_BATCHES,${ceil_div:${oc.decode:${oc.env:VAL_SAMPLES,6144}},${model.global_batch_size}}}}
++  eval_batch_size: ${oc.decode:${oc.env:EVAL_BATCH_SIZE,${min:1024,${model.global_batch_size}}}}  # limit validation to at most 1024 samples per batch
++  eval_context_parallel_size: ${oc.decode:${oc.env:EVAL_CONTEXT_PARALLEL_SIZE,null}}
++
++  warmup_train_steps: ${oc.decode:${oc.env:WARMUP_TRAIN_STEPS,-1}}
++  warmup_validation_steps: ${oc.decode:${oc.env:WARMUP_VALIDATION_STEPS,-1}}
++
++data:
++  dataset: ${oc.decode:${oc.env:DATASET,8b}}
++  num_workers: 8
++  dataloader_type: "single"
++  path_to_cache: "/npy_index"
++  reset_position_ids: False
++  reset_attention_mask: False
++  eod_mask_loss: False
++  # Synthetic-data mode: when True (USE_SYNTHETIC_DATA=1 sets MOCK_DATASET=True),
++  # MockGPTDataset is used for both train and validation, and the tokenizer is
++  # swapped to NullTokenizer so the HF tokenizer mount is no longer required.
++  mock_dataset: ${oc.decode:${oc.env:MOCK_DATASET,False}}
++  mock_tokenizer_vocab_size: ${oc.decode:${oc.env:MOCK_TOKENIZER_VOCAB_SIZE,129280}}
++
++optim:
++  lr: ${oc.decode:${oc.env:LR,${round:${multiply:0.000024,${pow:${div:${model.global_batch_size},16384},0.5}},9}}}
++  min_lr: ${oc.decode:${oc.env:MIN_LR,5e-6}}
++  use_precision_aware_optimizer: ${oc.decode:${oc.env:USE_PRECISION_AWARE_OPTIMIZER, True}}
++  adam_eps: ${oc.decode:${oc.env:ADAM_EPS,1e-8}}
++  sched:
++    lr_warmup_iters: ${oc.decode:${oc.env:LR_WARMUP_ITERS,0}}
++    lr_decay_iters: ${oc.decode:${oc.env:LR_DECAY_ITERS,11996}}
++  overlap_grad_reduce: ${oc.decode:${oc.env:OVERLAP_GRAD_REDUCE,True}}
++  overlap_param_gather: ${oc.decode:${oc.env:OVERLAP_PARAM_GATHER,True}}
++  align_param_gather:  ${oc.decode:${oc.env:ALIGN_PARAM_GATHER,False}}
++  use_distributed_optimizer: ${oc.decode:${oc.env:USE_DIST_OPTIMIZER,True}}
++  bucket_size: ${oc.decode:${oc.env:BUCKET_SIZE,134217728}}
++  fp8_param_gather: ${oc.decode:${oc.env:FP8_PARAM_GATHER,False}}
++  fp4_param_gather: ${oc.decode:${oc.env:FP4_PARAM_GATHER,False}}
++  reuse_grad_buf_for_mxfp8_param_ag: ${oc.decode:${oc.env:REUSE_GRAD_BUF_FOR_MXFP8_PARAM_AG,False}}
++  skip_training_cg_param_ag: ${oc.decode:${oc.env:SKIP_TRAIN_CG_PARAM_AG,False}}
++  num_distributed_optimizer_instances: ${oc.decode:${oc.env:NUM_DISTOPT_INSTANCES,1}}
++  outer_dp_sharding_strategy: ${oc.decode:${oc.env:OUTER_DP_SHARDING_STRATEGY,no_shard}}
++  nccl_ub_dp: ${oc.decode:${oc.env:NCCL_UB_DP,False}}
++  overlap_param_gather_with_optim_step: ${oc.decode:${oc.env:OVERLAP_PARAM_GATHER_WITH_OPTIM_STEP,False}}
++
++  # If true, manually register the FSDP communication buffers to NCCL user buffer.
++  # This option is only effective when use_megatron_fsdp and nccl_ub is set.
++  # For symmetric registration with large models, the registration itself can take
++  # a significant amount of time. This option minimizes the number of registration calls
++  # to minimize the registration time.
++  fsdp_manual_registration: ${oc.decode:${oc.env:FSDP_MANUAL_REGISTRATION,False}}
++  optimizer_cuda_graph: ${oc.decode:${oc.env:OPTIMIZER_CG, False}}
++  on_device_clip_grad: ${oc.decode:${oc.env:ON_DEVICE_CLIP_GRAD, False}}
++
++exp_manager:
++  explicit_log_dir: '/results'
++  load_optim: ${oc.decode:${oc.env:LOAD_OPTIMIZER,False}}
++  load_rng_state: ${oc.decode:${oc.env:LOAD_RNG_STATE,False}}
++  save_optim: ${oc.decode:${oc.env:SAVE_OPTIMIZER,False}}
++  save_rng_state: ${oc.decode:${oc.env:SAVE_RNG_STATE,False}}
++  async_save: False
++  save_interval: ${oc.decode:${oc.env:CHECKPOINT_SAVE_INTERVAL,-1}}  # if negative, do not save
++  most_recent_k: ${oc.decode:${oc.env:CHECKPOINT_MOST_RECENT_K,1}}
++  # Base dir (mounted at /checkpoints); LOAD_CHECKPOINT is the container path to load from (e.g. /checkpoints/mbridge-ckpt)
++  load_checkpoints_dir: ${oc.env:LOAD_CHECKPOINTS_DIR,null}
++  load_checkpoint: ${oc.env:LOAD_CHECKPOINT,/checkpoints}
++  load_checkpoint_step: ${oc.decode:${oc.env:LOAD_CHECKPOINT_STEP,null}}  # specifies, which checkpoint to load; by default, load the latest checkpoint
++
++custom:
++  force_success_status: ${oc.decode:${oc.env:FORCE_SUCCESS_STATUS,0}} # If True, sets the MLLOG status to SUCCESS at run_stop even if target accuracy was not reached so the dryrun report parsing works
++  target_log_ppl: ${oc.decode:${oc.env:TARGET_LOG_PPL,3.6}}
+diff --git a/examples/zero_sm_pp/deepseek_mlperf/conf/model/12layer.yaml b/examples/zero_sm_pp/deepseek_mlperf/conf/model/12layer.yaml
+new file mode 100755
+index 000000000..6ff8b4a4b
+--- /dev/null
++++ b/examples/zero_sm_pp/deepseek_mlperf/conf/model/12layer.yaml
+@@ -0,0 +1,15 @@
++# 12-layer proxy model for testing
++defaults:
++  - 671b
++
++model_size: "12layer"
++
++# Architecture overrides for 12-layer model
++architecture_overrides:
++  num_layers: 12
++  moe_layer_freq: [0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]  # first dense, rest MoE
++  num_moe_experts: ${oc.decode:${oc.env:NUM_MOE_EXPERTS,32}}
++  moe_router_group_topk: 1
++  moe_router_num_groups: 1
++
++micro_batch_size: ${oc.decode:${oc.env:MICRO_BATCH_SIZE,1}}
+diff --git a/examples/zero_sm_pp/deepseek_mlperf/conf/model/16expert.yaml b/examples/zero_sm_pp/deepseek_mlperf/conf/model/16expert.yaml
+new file mode 100755
+index 000000000..6b1adfc27
+--- /dev/null
++++ b/examples/zero_sm_pp/deepseek_mlperf/conf/model/16expert.yaml
+@@ -0,0 +1,8 @@
++# Small 12-layer model for functional testing
++defaults:
++  - 671b
++
++model_size: "debug"
++
++architecture_overrides:
++  num_moe_experts: 16
+diff --git a/examples/zero_sm_pp/deepseek_mlperf/conf/model/671b.yaml b/examples/zero_sm_pp/deepseek_mlperf/conf/model/671b.yaml
+new file mode 100755
+index 000000000..5f9bc163a
+--- /dev/null
++++ b/examples/zero_sm_pp/deepseek_mlperf/conf/model/671b.yaml
+@@ -0,0 +1,125 @@
++# Full 671B model configuration
++# This uses defaults from HuggingFace config (no architecture overrides)
++
++model_size: "671b"
++
++mtp_num_layers: ${oc.decode:${oc.env:MTP_NUM_LAYERS,1}}
++mtp_loss_scaling_factor: ${oc.decode:${oc.env:MTP_LOSS_SCALING_FACTOR,0.1}}
++moe_router_topk: ${oc.decode:${oc.env:ROUTER_TOP_K,8}}
++moe_router_num_groups: ${oc.decode:${oc.env:ROUTER_NUM_GROUPS,8}}
++moe_router_group_topk: ${oc.decode:${oc.env:ROUTER_GROUP_TOP_K,4}}
++moe_router_topk_scaling_factor: ${oc.decode:${oc.env:ROUTER_TOP_K_SCALING_FACTOR,2.5}}
++# NOTE: all parallelism parameters except ETP must be set
++tensor_model_parallel_size: ${oc.decode:${oc.env:TENSOR_MODEL_PARALLEL,1}}
++pipeline_model_parallel_size: ${oc.decode:${oc.env:PIPELINE_MODEL_PARALLEL,1}}
++virtual_pipeline_model_parallel_size: ${oc.decode:${oc.env:INTERLEAVED_PIPELINE,null}}
++context_parallel_size: ${oc.decode:${oc.env:CONTEXT_PARALLEL,1}}
++expert_model_parallel_size: ${oc.decode:${oc.env:EXPERT_PARALLEL,1}}
++expert_tensor_parallel_size: ${oc.decode:${oc.env:EXPERT_TENSOR_PARALLEL,1}}
++pipeline_layout: ${oc.env:PIPELINE_LAYOUT,null}
++use_symmetric_memory_p2p: ${oc.decode:${oc.env:SYM_MEM_PP,False}}
++
++mcore_fsdp: ${oc.decode:${oc.env:USE_MCORE_FSDP,False}}
++
++# If True, use all-gather during the initial Megatron-FSDP parameter synchronization step.
++# Set to False to enable Cuda Graphs for FSDP.
++fsdp_all_gather_in_start_param_sync: ${oc.decode:${oc.env:FSDP_AG_PARAM_SYNC,True}}
++# Megatron-FSDP CUDA graph-safe grad/param handling (see megatron_fsdp distributed_data_parallel_config).
++megatron_fsdp_cuda_graph_mode: ${oc.decode:${oc.env:MEGATRON_FSDP_CUDA_GRAPH_MODE,False}}
++
++moe_token_dispatcher_type: ${oc.decode:${oc.env:MOE_TOKEN_DISPATCHER_TYPE,alltoall}}
++moe_flex_dispatcher_backend: ${oc.decode:${oc.env:MOE_FLEX_DISPATCHER_BACKEND,null}}
++moe_hybridep_num_sms: ${oc.decode:${oc.env:MOE_HYBRIDEP_NUM_SMS,32}}
++moe_hybridep_num_sms_preprocessing: ${oc.decode:${oc.env:MOE_HYBRIDEP_NUM_SMS_PREPROCESSING,108}}
++moe_grouped_gemm: ${oc.decode:${oc.env:MOE_GROUPED_GEMM,True}}
++moe_single_grouped_weight: ${oc.decode:${oc.env:MOE_SINGLE_GROUPED_WEIGHT,False}}
++moe_single_grouped_bias: ${oc.decode:${oc.env:MOE_SINGLE_GROUPED_BIAS,False}}
++moe_permute_fusion: ${oc.decode:${oc.env:MOE_PERMUTE_FUSION,True}}
++moe_router_fusion: ${oc.decode:${oc.env:MOE_ROUTER_FUSION,True}}
++moe_router_force_load_balancing: ${oc.decode:${oc.env:MOE_ROUTER_FORCE_LOAD_BALANCING,False}}
++moe_router_force_biased: ${oc.decode:${oc.env:MOE_ROUTER_FORCE_BIASED,null}}
++apply_rope_fusion: ${oc.decode:${oc.env:APPLY_ROPE_FUSION,False}}
++moe_router_dtype: ${oc.decode:${oc.env:MOE_ROUTER_DTYPE,fp32}}
++moe_aux_loss_coeff: ${oc.decode:${oc.env:MOE_AUX_LOSS_COEFF,0.01}}
++moe_expert_rank_capacity_factor: ${oc.decode:${oc.env:MOE_EXPERT_RANK_CAPACITY_FACTOR,null}}
++moe_paged_stash: ${oc.decode:${oc.env:MOE_PAGED_STASH,False}}
++moe_paged_stash_buffer_size_factor_cuda: ${oc.decode:${oc.env:MOE_PAGED_STASH_BUFFER_SIZE_FACTOR_CUDA,null}}
++moe_paged_stash_buffer_size_factor_cpu: ${oc.decode:${oc.env:MOE_PAGED_STASH_BUFFER_SIZE_FACTOR_CPU,null}}
++overlap_moe_expert_parallel_comm: ${oc.decode:${oc.env:OVERLAP_MOE_EXPERT_PARALLEL_COMM,False}}
++high_priority_a2a_comm_stream: ${oc.decode:${oc.env:HIGH_PRIORITY_A2A_COMM_STREAM,False}}
++delay_wgrad_compute: ${oc.decode:${oc.env:DELAY_WGRAD_COMPUTE,False}}
++overlap_dispatch_backward_with_experts_wgrad: ${oc.decode:${oc.env:OVERLAP_DISPATCH_BACKWARD_WITH_EXPERTS_WGRAD,False}}
++use_dynamic_comp_stream: ${oc.decode:${oc.env:USE_DYNAMIC_COMP_STREAM,False}}
++log_moe_overload_factor: ${oc.decode:${oc.env:LOG_MOE_OVERLOAD_FACTOR,False}}
++fused_residual_rmsnorm: ${oc.decode:${oc.env:FUSED_RESIDUAL_RMSNORM,True}}
++use_te_activation_func: ${oc.decode:${oc.env:USE_TE_ACTIVATION_FUNC,False}}
++
++# Fuse weight gradient accumulation to GEMMs.
++gradient_accumulation_fusion: ${oc.decode:${oc.env:GRAD_ACCUM_FUSION,False}}
++# Average gradients in collective operations - fuses scaling and reduction for gradient averaging.
++average_in_collective: ${oc.decode:${oc.env:AVERAGE_IN_COLLECTIVE,False}}
++
++micro_batch_size: ${oc.decode:${oc.env:MICRO_BATCH_SIZE,1}}
++global_batch_size: ${oc.decode:${oc.env:GLOBAL_BATCH_SIZE,${multiply:${oc.decode:${oc.env:MINIBS}},${floor_div:${multiply:${trainer.devices},${trainer.num_nodes}},${multiply:${multiply:${model.tensor_model_parallel_size},${model.pipeline_model_parallel_size}},${model.context_parallel_size}}}}}}
++
++encoder_seq_length: ${oc.decode:${oc.env:SEQ_LENGTH,4096}}
++recompute_modules: ${oc.env:RECOMPUTE_MODULES, ""}
++cuda_graph_implementation: ${oc.env:CUDA_GRAPH_IMPLEMENTATION, "none"}
++cuda_graph_modules: ${oc.env:CUDA_GRAPH_MODULES,null}
++cuda_graph_warmup_steps: ${oc.decode:${oc.env:CUDA_GRAPH_WARMUP_STEPS,null}}
++# Opt-in: torch.autograd.graph.set_override_stale_capture_stream(True) before train (CUDA graphs / FSDP).
++torch_override_stale_capture_stream: ${oc.decode:${oc.env:TORCH_OVERRIDE_STALE_CAPTURE_STREAM,False}}
++
++cpu_offloading: ${oc.decode:${oc.env:CPU_OFFLOADING,False}}
++cpu_offloading_num_layers: ${oc.decode:${oc.env:CPU_OFFLOADING_NUM_LAYERS,95}}
++cpu_offloading_retain_pinned_cpu_buffers: ${oc.decode:${oc.env:CPU_OFFLOADING_RETAIN_PINNED_CPU_BUFFERS,False}}
++
++# Fine-grained activation offloading
++# See https://github.com/NVIDIA/Megatron-LM/pull/1913 for details.
++fine_grained_activation_offloading: ${oc.decode:${oc.env:FINE_GRAINED_ACTIVATION_OFFLOADING,False}}
++# Allowed modules: [core_attn, attn_proj, expert_fc1, moe_act, attn_norm, mlp_norm, qkv_linear]
++offload_modules: ${oc.env:OFFLOAD_MODULES, ""}
++min_offloaded_tensor_size: ${oc.decode:${oc.env:MIN_OFFLOADED_TENSOR_SIZE,1048576}}
++# Max inflight D2H offloads per fine-grained offloading group name (see TransformerConfig).
++# Unset / null = do not cap (MCore default). Non-negative int when set.
++fine_grained_offloading_max_inflight_offloads: ${oc.decode:${oc.env:FINE_GRAINED_OFFLOADING_MAX_INFLIGHT_OFFLOADS,null}}
++
++seed: ${oc.decode:${oc.env:SEED,1234}}
++use_rng_tracker: ${oc.decode:${oc.env:USE_RNG_TRACKER,True}}
++fp8: ${oc.decode:${oc.env:FP8,False}}
++fp8_dot_product_attention: ${oc.decode:${oc.env:FP8_DPA,False}}
++fp8_output_proj: ${oc.decode:${oc.env:FP8_OUTPUT_PROJ,False}}
++fp4: ${oc.decode:${oc.env:FP4,False}}
++use_transformer_engine_op_fuser: ${oc.decode:${oc.env:USE_TE_OPS,False}}
++mla_down_proj_fusion: ${oc.decode:${oc.env:MLA_DOWN_PROJ_FUSION,False}}
++fp4_recipe: ${oc.decode:${oc.env:FP4_RECIPE,nvfp4}}
++nsys_profile:
++  enabled: ${oc.decode:${oc.env:PROFILE,False}}
++  start_step: ${oc.decode:${oc.env:PROFILE_START_STEP,10}}
++  end_step: ${oc.decode:${oc.env:PROFILE_END_STEP,12}}
++  ranks_str: ${oc.env:PROFILE_RANKS,0}  # Comma-separated PROFILE_RANKS env var, default to "0" if not set (parsed in Python)
++  gen_shape: ${oc.decode:${oc.env:GEN_SHAPE,False}}
++  nvtx_ranges: ${oc.decode:${oc.env:MBRIDGE_NVTX_RANGES,False}} # Set to True to enable NVTX profiling in both Nemo & MCore
++  use_pytorch_profiler: ${oc.decode:${oc.env:USE_PYTORCH_PROFILER,False}}
++  memory_profiler:
++    enable: ${oc.decode:${oc.env:ENABLE_MEMORY_PROFILER,False}}
++    file_prefix: ${oc.env:MEMORY_PROFILE_FILENAME,memdump}
++    # PyTorch memory snapshot (memory_viz). Independent of nsys PROFILE_START_STEP/END_STEP.
++    # MEMORY_PROFILE_START_STEP unset -> null: begin _record_memory_history at on_train_start (before WarmupCallback).
++    # Set to 0,1,... to begin when train_state.step reaches that value (main loop only; misses warmup capture).
++    start_step: ${oc.decode:${oc.env:MEMORY_PROFILE_START_STEP,null}}
++    # MEMORY_PROFILE_END_STEP unset -> null: dump at on_train_end. Set to N to dump after that train step ends.
++    end_step: ${oc.decode:${oc.env:MEMORY_PROFILE_END_STEP,null}}
++enable_perf_configs: ${oc.decode:${oc.env:ENABLE_PERF_CONFIGS,False}}
++
++
++nccl_communicator_config_path: ${oc.decode:${oc.env:NCCL_CFG_PATH,null}}
++sharp: ${oc.decode:${oc.env:SHARP,False}}
++use_tp_pp_dp_mapping: ${oc.decode:${oc.env:TP_PP_DP_MAPPING,False}}
++
++# Checkpointing
++resume_from_checkpoint: ${oc.env:LOAD_CHECKPOINT,null}
++dist_ckpt_format: ${if:${model.mcore_fsdp},fsdp_dtensor,torch_dist}
++dist_ckpt_parallel_load: ${oc.decode:${oc.env:DIST_CKPT_PARALLEL_LOAD,True}}
++
++tokenizer: "/tokenizer"  # mounted in config_mounts.sh
+diff --git a/examples/zero_sm_pp/deepseek_mlperf/conf/model/671b_5layers.yaml b/examples/zero_sm_pp/deepseek_mlperf/conf/model/671b_5layers.yaml
+new file mode 100644
+index 000000000..95fc343d7
+--- /dev/null
++++ b/examples/zero_sm_pp/deepseek_mlperf/conf/model/671b_5layers.yaml
+@@ -0,0 +1,11 @@
++defaults:
++  - 671b
++
++model_size: "671b_5layers"
++
++# Architecture overrides for small model
++architecture_overrides:
++  num_layers: 5
++  moe_layer_freq: [0, 1, 1, 1, 1]  # first dense, rest MoE
++  num_moe_experts: ${oc.decode:${oc.env:NUM_MOE_EXPERTS,256}}
++
+diff --git a/examples/zero_sm_pp/deepseek_mlperf/conf/model/671b_small.yaml b/examples/zero_sm_pp/deepseek_mlperf/conf/model/671b_small.yaml
+new file mode 100644
+index 000000000..403e2c682
+--- /dev/null
++++ b/examples/zero_sm_pp/deepseek_mlperf/conf/model/671b_small.yaml
+@@ -0,0 +1,11 @@
++defaults:
++  - 671b
++
++model_size: "671b_small"
++
++# Architecture overrides for small model
++architecture_overrides:
++  num_layers: 19
++  moe_layer_freq: [0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]  # first dense, rest MoE
++  num_moe_experts: ${oc.decode:${oc.env:NUM_MOE_EXPERTS,256}}
++
+diff --git a/examples/zero_sm_pp/deepseek_mlperf/conf/model/small.yaml b/examples/zero_sm_pp/deepseek_mlperf/conf/model/small.yaml
+new file mode 100755
+index 000000000..25acdcb70
+--- /dev/null
++++ b/examples/zero_sm_pp/deepseek_mlperf/conf/model/small.yaml
+@@ -0,0 +1,15 @@
++# Small 12-layer model for functional testing
++defaults:
++  - 671b
++
++model_size: "small"
++
++# Architecture overrides for small model
++architecture_overrides:
++  num_layers: 2
++  moe_layer_freq: [0, 1]  # first dense, rest MoE
++  num_moe_experts: ${oc.decode:${oc.env:NUM_MOE_EXPERTS,256}}
++  
++
++# Small model may need different batch size for testing
++micro_batch_size: ${oc.decode:${oc.env:MICRO_BATCH_SIZE,1}}
+diff --git a/examples/zero_sm_pp/deepseek_mlperf/conf/nccl/custom_communicator_cta.yaml b/examples/zero_sm_pp/deepseek_mlperf/conf/nccl/custom_communicator_cta.yaml
+new file mode 100755
+index 000000000..16d5a72d6
+--- /dev/null
++++ b/examples/zero_sm_pp/deepseek_mlperf/conf/nccl/custom_communicator_cta.yaml
+@@ -0,0 +1,42 @@
++# Per-communicator NCCL option tuning
++# Set min/max CTAs and CGA sizes for different NCCL communicators
++dp:
++  cga_cluster_size: 4
++  min_ctas: 1
++  max_ctas: 8
++pp:
++  cga_cluster_size: 2
++  min_ctas: 1
++  max_ctas: 2
++tp:
++  cga_cluster_size: 4
++  min_ctas: 1
++  max_ctas: 8
++dp_cp:
++  cga_cluster_size: 4
++  min_ctas: 1
++  max_ctas: 8
++cp:
++  cga_cluster_size: 1
++  min_ctas: 1
++  max_ctas: 1
++mp:
++  cga_cluster_size: 2
++  min_ctas: 1
++  max_ctas: 2
++embd:
++  cga_cluster_size: 2
++  min_ctas: 1
++  max_ctas: 2
++tp_dp_cp:
++  cga_cluster_size: 1
++  min_ctas: 1
++  max_ctas: 1
++tp_dp:
++  cga_cluster_size: 1
++  min_ctas: 1
++  max_ctas: 1
++tp_exp:
++  cga_cluster_size: 1
++  min_ctas: 1
++  max_ctas: 1
+diff --git a/examples/zero_sm_pp/deepseek_mlperf/pretrain.py b/examples/zero_sm_pp/deepseek_mlperf/pretrain.py
+new file mode 100755
+index 000000000..b8b40b16b
+--- /dev/null
++++ b/examples/zero_sm_pp/deepseek_mlperf/pretrain.py
+@@ -0,0 +1,668 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import os
++
++import hydra
++import torch
++from callback_logging import DeltaTimingCallback, MLPerfLoggingCallback, mllogger
++from callback_warmup import WarmupCallback
++from callback_memory_profiler import MemoryProfileCallback
++from megatron.bridge.recipes.deepseek import deepseek_v3_pretrain_config
++from megatron.bridge.recipes.deepseek.deepseek_v3 import (
++    set_deepseek_v3_pipeline_model_parallel_layout,
++)
++from megatron.bridge.training.config import (
++    CheckpointConfig,
++    CommOverlapConfig,
++    ConfigContainer,
++    DistributedDataParallelConfig,
++    DistributedInitConfig,
++    GPTDatasetConfig,
++    LoggerConfig,
++    ProfilingConfig,
++)
++from megatron.bridge.training.flex_dispatcher_backend import (
++    apply_flex_dispatcher_backend,
++)
++from megatron.bridge.training.gpt_step import forward_step
++from megatron.bridge.training.pretrain import pretrain
++from megatron.bridge.training.tokenizers.config import TokenizerConfig
++from megatron.bridge.utils.cuda_graph import set_cuda_graph_modules
++from megatron.core.transformer.cuda_graph_config import normalize_cuda_graph_modules
++from omegaconf import OmegaConf
++from utils import get_rank, init_logging
++
++from callback_eval_cp import EvalCPCallback
++
++OmegaConf.register_new_resolver("add", lambda x, y: x + y)
++OmegaConf.register_new_resolver("multiply", lambda x, y: x * y)
++OmegaConf.register_new_resolver("ceil_div", lambda x, y: (x + y - 1) // y)
++OmegaConf.register_new_resolver("floor_div", lambda x, y: x // y)
++OmegaConf.register_new_resolver("div", lambda x, y: x / y)
++OmegaConf.register_new_resolver("if", lambda x, y, z: y if x else z)
++OmegaConf.register_new_resolver("lt", lambda x, y: x < y)
++OmegaConf.register_new_resolver("eq", lambda x, y: x == y)
++OmegaConf.register_new_resolver("neq", lambda x, y: x != y)
++OmegaConf.register_new_resolver("or", lambda *args: any(args))
++OmegaConf.register_new_resolver("min", lambda x, y: min(x, y))
++OmegaConf.register_new_resolver("floor", lambda x: int(x // 1))
++OmegaConf.register_new_resolver("pow", lambda x, y: x**y)
++OmegaConf.register_new_resolver("round", lambda x, y: round(x, y))
++
++
++def _normalize_cuda_graph_modules(value):
++    modules = value
++    if isinstance(modules, str):
++        modules = [
++            stripped_module
++            for module in modules.split(",")
++            if (stripped_module := module.strip())
++        ]
++    normalized_modules, deprecated_scopes, _ = normalize_cuda_graph_modules(modules)
++    if deprecated_scopes:
++        raise ValueError(
++            "Deprecated CUDA graph module values are not supported; "
++            f"use CUDA_GRAPH_MODULES with module names only: {deprecated_scopes}"
++        )
++    return normalized_modules
++
++
++def get_data(config):
++    # Parameters
++    seq_length = config.model.encoder_seq_length
++    seed = config.model.seed
++
++    if config.data.mock_dataset:
++        from megatron.bridge.training.config import MockGPTDatasetConfig
++        return MockGPTDatasetConfig(
++            seq_length=seq_length,
++            dataloader_type=config.data.dataloader_type,
++            random_seed=seed,
++            num_workers=config.data.num_workers,
++            path_to_cache=None,
++            split="900,50,50",
++            data_sharding=True,
++            create_attention_mask=False,
++            reset_position_ids=config.data.reset_position_ids,
++            reset_attention_mask=config.data.reset_attention_mask,
++            eod_mask_loss=config.data.eod_mask_loss,
++        )
++
++    val_test_path = "/preproc_data/c4-validation-91205-samples.en_text_document"
++
++    is_8b_dataset = os.getenv("DATASET") == "8b"
++    r = [6] if is_8b_dataset else [6, 7]
++    train_datasets = [f"/preproc_data/c4-train.en_{idx}_text_document" for idx in r]
++    train_datasets_weights = [50] * len(r)
++
++    data_paths = [(train_datasets, train_datasets_weights), ([val_test_path], None), ([val_test_path], None)]
++
++    return GPTDatasetConfig(
++        dataloader_type=config.data.dataloader_type,
++        blend_per_split=data_paths,
++        sequence_length=seq_length,
++        random_seed=seed,
++        num_workers=config.data.num_workers,
++        path_to_cache=config.data.path_to_cache,
++        defer_npy_index_mmap=True,
++        fast_cache_load=True,
++        reset_position_ids=config.data.reset_position_ids,
++        reset_attention_mask=config.data.reset_attention_mask,
++        eod_mask_loss=config.data.eod_mask_loss,
++    )
++
++
++def log_hyperparams(config, mbridge_config: ConfigContainer):
++    bmark = mllogger.constants.DEEPSEEKV3_671B
++    if config.trainer.max_steps <= config.optim.sched.lr_warmup_iters:
++        config.optim.sched.lr_warmup_iters = max(config.trainer.max_steps // 2, 1)
++    mllogger.mlperf_submission_log(bmark)
++
++    # Collects configs to be logged
++    logging_configs = {
++        # seeds
++        mllogger.constants.SEED: config.model.seed,
++        # HPs
++        mllogger.constants.MAX_STEPS: config.trainer.max_steps,
++        mllogger.constants.GLOBAL_BATCH_SIZE: config.model.global_batch_size,
++        mllogger.constants.GRADIENT_ACCUMULATION_STEPS: (int(os.environ["MINIBS"]) / config.model.micro_batch_size),
++        mllogger.constants.MAX_SEQUENCE_LENGTH: config.model.encoder_seq_length,
++        mllogger.constants.EVAL_SAMPLES: config.trainer.limit_val_batches * config.trainer.eval_batch_size,
++        mllogger.constants.TRAIN_SAMPLES: 1574207408,
++        mllogger.constants.INIT_CHECKPOINT_STEP: 0,
++        mllogger.constants.MOE_AUX_LOSS_COEFF: config.model.moe_aux_loss_coeff,
++        # Optimizers
++        mllogger.constants.OPT_NAME: mllogger.constants.ADAMW,
++        mllogger.constants.OPT_BASE_LR: mbridge_config.optimizer.lr,
++        mllogger.constants.OPT_ADAMW_BETA_1: mbridge_config.optimizer.adam_beta1,
++        mllogger.constants.OPT_ADAMW_BETA_2: mbridge_config.optimizer.adam_beta2,
++        mllogger.constants.OPT_ADAMW_EPSILON: mbridge_config.optimizer.adam_eps,
++        mllogger.constants.OPT_ADAMW_WEIGHT_DECAY: mbridge_config.optimizer.weight_decay,
++        mllogger.constants.OPT_GRADIENT_CLIP_NORM: mbridge_config.optimizer.clip_grad,
++        # Schedulers
++        mllogger.constants.OPT_END_LR: mbridge_config.optimizer.min_lr,
++        mllogger.constants.OPT_LR_WARMUP_STEPS: mbridge_config.scheduler.lr_warmup_iters,
++        mllogger.constants.OPT_LR_DECAY_STEPS: config.optim.sched.lr_decay_iters,
++        mllogger.constants.OPT_LR_DECAY_SCHEDULE: "cosine with linear warmup",
++        # extra
++        mllogger.constants.TENSOR_PARALLELISM: config.model.tensor_model_parallel_size,
++        mllogger.constants.PIPELINE_PARALLELISM: config.model.pipeline_model_parallel_size,
++        mllogger.constants.CONTEXT_PARALLELISM: config.model.context_parallel_size,
++        mllogger.constants.EXPERT_PARALLELISM: config.model.expert_model_parallel_size,
++        mllogger.constants.MICRO_BATCH_SIZE: config.model.micro_batch_size,
++        "lowest_numerical_precision_in_linear": os.environ.get("MLPERF_LINEAR_PRECISION", ""),
++        "lowest_numerical_precision_in_attn": os.environ.get("MLPERF_ATTN_PRECISION", ""),
++        "lowest_numerical_precision_in_comm": os.environ.get("MLPERF_COMM_PRECISION", ""), 
++        # custom
++        "target_accuracy": config.custom.target_log_ppl,
++    }
++
++    for key, value in logging_configs.items():
++        mllogger.event(key=key, value=value)
++
++def get_mixed_precision(cfg):
++    from megatron.bridge.training.mixed_precision import (
++        bf16_mixed,
++        bf16_with_mxfp8_mixed,
++        bf16_with_nvfp4_mixed,
++    )
++    fp8 = cfg.model.fp8
++    fp4 = cfg.model.fp4
++    # Assert that fp8 and fp4 cannot both be true
++    assert not (fp8 and fp4), "Both fp8 and fp4 cannot be True at the same time."
++
++    if fp8:
++        precision_config = bf16_with_mxfp8_mixed()
++        precision_config.fp8_param_gather = cfg.optim.fp8_param_gather
++        precision_config.reuse_grad_buf_for_mxfp8_param_ag = cfg.optim.reuse_grad_buf_for_mxfp8_param_ag
++        precision_config.fp8_dot_product_attention = cfg.model.fp8_dot_product_attention
++    elif fp4:
++        precision_config = bf16_with_nvfp4_mixed()
++        precision_config.fp8_dot_product_attention = cfg.model.fp8_dot_product_attention
++        precision_config.fp4_param_gather = cfg.optim.fp4_param_gather
++    else:
++        precision_config = bf16_mixed()
++        if cfg.model.fp8_dot_product_attention:
++            raise ValueError("fp8_dot_product_attention (FP8_DPA) is only supported for mxfp8 and nvfp4.")
++    return precision_config
++
++
++def _parse_memory_profiler_step(value):
++    """Normalize Hydra/oc.env values for MemoryProfileCallback start_step / end_step."""
++    if value is None:
++        return None
++    if isinstance(value, str):
++        s = value.strip().lower()
++        if s in ("", "null", "none", "~"):
++            return None
++        return int(s)
++    return int(value)
++
++
++def override_logger_config(hydra_config, logger_config: LoggerConfig) -> LoggerConfig:
++    logger_config.log_interval = hydra_config.trainer.log_every_n_steps
++    # Enable tensorboard logging
++    if hydra_config.model.nsys_profile.use_pytorch_profiler:
++        pytorch_profile_dir = os.path.join(hydra_config.exp_manager.explicit_log_dir, "pytorch_profile")
++        logger_config.tensorboard_dir = pytorch_profile_dir
++    return logger_config
++
++def get_profiling_config(config):
++    # Parse ranks_str from YAML (which reads PROFILE_RANKS env var) into list of integers
++    pytorch_profile_dir = os.path.join(config.exp_manager.explicit_log_dir, "pytorch_profile")
++    ranks_str = config.model.nsys_profile.ranks_str
++    profile_ranks = [0]
++    if ranks_str and ranks_str.strip():
++        profile_ranks = [int(x.strip()) for x in ranks_str.split(",") if x.strip()]
++    # Memory profiling is driven by MemoryProfileCallback, not MBridge. Do not set
++    # record_memory_history=True in ProfilingConfig, or MBridge will also try to
++    # save memory snapshots and can conflict with the callback.
++    return ProfilingConfig(
++        use_nsys_profiler=config.model.nsys_profile.enabled,
++        use_pytorch_profiler=config.model.nsys_profile.use_pytorch_profiler,
++        record_memory_history=False,
++        memory_snapshot_path=os.path.join(pytorch_profile_dir, f"{config.model.nsys_profile.memory_profiler.file_prefix}.pickle"),
++        profile_step_start=config.model.nsys_profile.start_step,
++        profile_step_end=config.model.nsys_profile.end_step,
++        profile_ranks=profile_ranks,
++        record_shapes=config.model.nsys_profile.gen_shape,
++        nvtx_ranges=config.model.nsys_profile.nvtx_ranges,
++    )
++
++def override_performance_configs(cfg):
++    # (TODO:) Override for fast validation. Set this through yaml configs later.
++    # disable ddp checks
++    cfg.ddp.check_for_nan_in_grad = False
++    cfg.ddp.check_for_large_grads = False
++    cfg.rerun_state_machine.check_for_nan_in_loss = False
++    # disable fp32 grad reduce
++    cfg.ddp.grad_reduce_in_fp32 = False
++    cfg.mixed_precision.grad_reduce_in_fp32 = False
++
++    # enable overlap; disable overlap_param_gather for mxfp8 accuracy
++    cfg.comm_overlap.overlap_grad_reduce = True
++
++    # cfg.comm_overlap.overlap_param_gather = False
++    # cfg.ddp.overlap_param_gather = False
++    # cfg.optimizer.overlap_param_gather = False
++
++    # cfg.optimizer.overlap_param_gather_with_optimizer_step = True
++    # cfg.comm_overlap.overlap_param_gather_with_optimizer_step = True
++
++    # reset manaual GC interval in training to 100
++    cfg.train.manual_gc_interval = 100
++
++    # (TODO:) Best configs from NeMo, verify with real dataset later.
++    cfg.dataset.num_workers = 0
++    cfg.dataset.pin_memory = False
++
++    # keep it as True for now. But seems stale
++    cfg.dist.enable_megatron_core_experimental = True
++
++
++def apply_torch_cuda_graph_autograd_settings(hydra_cfg) -> None:
++    """Fix stale CUDA stream references in autograd during graph capture."""
++    if hydra_cfg.model.torch_override_stale_capture_stream:
++        torch.autograd.graph.set_override_stale_capture_stream(True)
++
++
++def get_tokenizer_config(cfg):
++    if cfg.data.mock_dataset:
++        return TokenizerConfig(
++            tokenizer_type="NullTokenizer",
++            vocab_size=cfg.data.mock_tokenizer_vocab_size,
++        )
++
++    return TokenizerConfig(
++        tokenizer_type="HuggingFaceTokenizer",
++        tokenizer_model=cfg.model.tokenizer,
++        hf_tokenizer_kwargs={"use_fast": True},
++    )
++
++
++def override_comm_overlap_config(hydra_config, comm_overlap_config) -> CommOverlapConfig:
++    comm_overlap_config.overlap_grad_reduce = hydra_config.optim.overlap_grad_reduce
++    comm_overlap_config.overlap_param_gather = hydra_config.optim.overlap_param_gather
++    comm_overlap_config.overlap_param_gather_with_optimizer_step = hydra_config.optim.overlap_param_gather_with_optim_step
++    comm_overlap_config.align_param_gather = hydra_config.optim.align_param_gather
++    comm_overlap_config.bucket_size = hydra_config.optim.bucket_size
++    comm_overlap_config.overlap_moe_expert_parallel_comm = hydra_config.model.overlap_moe_expert_parallel_comm
++    comm_overlap_config.delay_wgrad_compute = hydra_config.model.delay_wgrad_compute
++    return comm_overlap_config
++
++
++def override_ddp_config(hydra_config, ddp_config) -> DistributedDataParallelConfig:
++    ddp_config.bucket_size = hydra_config.optim.bucket_size
++    # Overlap
++    ddp_config.overlap_grad_reduce = hydra_config.optim.overlap_grad_reduce
++    ddp_config.overlap_param_gather = hydra_config.optim.overlap_param_gather
++    ddp_config.align_param_gather = hydra_config.optim.align_param_gather
++    # Distributed optimizer
++    ddp_config.use_distributed_optimizer = hydra_config.optim.use_distributed_optimizer
++    ddp_config.num_distributed_optimizer_instances = hydra_config.optim.num_distributed_optimizer_instances
++    ddp_config.data_parallel_sharding_strategy = "optim_grads_params"
++    ddp_config.outer_dp_sharding_strategy = hydra_config.optim.outer_dp_sharding_strategy
++
++    # Assert if outer_dp sharding strategy is "optim" and
++    # num_distributed_optimizer_instances is 1.
++    if (hydra_config.optim.outer_dp_sharding_strategy == "optim"
++        and not hydra_config.optim.num_distributed_optimizer_instances > 1):
++        raise ValueError(
++            "Number of distributed optimizer instances must be greater than 1 "
++            "when outer_dp_sharding_strategy is 'optim'."
++        )
++
++    # FP8
++    ddp_config.fp8_param_gather = hydra_config.optim.fp8_param_gather
++    ddp_config.reuse_grad_buf_for_mxfp8_param_ag = hydra_config.optim.reuse_grad_buf_for_mxfp8_param_ag
++    # FSDP
++    ddp_config.fsdp_double_buffer = hydra_config.optim.nccl_ub_dp
++    ddp_config.use_megatron_fsdp = hydra_config.model.mcore_fsdp
++    ddp_config.fsdp_all_gather_in_start_param_sync = hydra_config.model.fsdp_all_gather_in_start_param_sync
++    ddp_config.megatron_fsdp_cuda_graph_mode = hydra_config.model.megatron_fsdp_cuda_graph_mode
++    # NCCL
++    ddp_config.nccl_ub = hydra_config.optim.nccl_ub_dp
++    ddp_config.fsdp_manual_registration = hydra_config.optim.fsdp_manual_registration
++
++    # Fuse scaling and reduction for gradient averaging.
++    ddp_config.average_in_collective = hydra_config.model.average_in_collective
++
++    return ddp_config
++
++def override_dist_config(hydra_config, dist_config) -> DistributedInitConfig:
++    dist_config.nccl_communicator_config_path = hydra_config.model.nccl_communicator_config_path
++    dist_config.use_tp_pp_dp_mapping = hydra_config.model.use_tp_pp_dp_mapping
++    dist_config.use_sharp = hydra_config.model.sharp
++    dist_config.use_gloo_process_groups = False
++    return dist_config
++
++def override_checkpoint_config(hydra_config, checkpoint_config) -> CheckpointConfig:
++    # LOAD_CHECKPOINT is the single env var; it is read in both model.resume_from_checkpoint (671b.yaml)
++    # and exp_manager.load_checkpoint (deepseekv3_671b.yaml). We decide the load path in one place below.
++    def _normalize(path):
++        if path in (None, "", "null"):
++            return None
++        return path
++
++    checkpoint_config.save = None
++    checkpoint_config.fully_parallel_load = hydra_config.model.dist_ckpt_parallel_load
++    checkpoint_config.dist_ckpt_strictness = "log_all"
++    checkpoint_config.load_optim = False
++    checkpoint_config.ckpt_format = hydra_config.model.dist_ckpt_format
++
++    if hydra_config.exp_manager.save_interval > 0:
++        checkpoint_config.save = os.path.join(hydra_config.exp_manager.explicit_log_dir, "checkpoints")
++        checkpoint_config.save_optim = hydra_config.exp_manager.save_optim
++        checkpoint_config.save_rng = hydra_config.exp_manager.save_rng_state
++        checkpoint_config.save_interval = hydra_config.exp_manager.save_interval
++        checkpoint_config.most_recent_k = hydra_config.exp_manager.most_recent_k
++        checkpoint_config.async_save = hydra_config.exp_manager.async_save
++    else:
++        checkpoint_config.save = None
++
++    # Single source for load path: when base dir is mounted use exp_manager.load_checkpoint (or /checkpoints);
++    # otherwise use model.resume_from_checkpoint for 671b. Both are set from LOAD_CHECKPOINT in the yamls.
++    if hydra_config.exp_manager.load_checkpoints_dir:
++        load_path = _normalize(getattr(hydra_config.exp_manager, "load_checkpoint", None))
++        checkpoint_config.load = load_path if load_path else "/checkpoints"
++        checkpoint_config.ckpt_step = hydra_config.exp_manager.load_checkpoint_step
++        checkpoint_config.load_optim = hydra_config.exp_manager.load_optim
++        checkpoint_config.load_rng = hydra_config.exp_manager.load_rng_state
++        checkpoint_config.exit_on_missing_checkpoint = False
++    else:
++        resume_from = _normalize(hydra_config.model.resume_from_checkpoint)
++        checkpoint_config.load = resume_from if hydra_config.model.model_size == "671b" else None
++
++    return checkpoint_config
++
++def create_config(cfg):
++    config = deepseek_v3_pretrain_config()
++    model_cfg = config.model
++
++    config.mixed_precision = get_mixed_precision(cfg)
++    model_cfg.moe_flex_dispatcher_backend = cfg.model.moe_flex_dispatcher_backend
++    model_cfg.mtp_num_layers = cfg.model.mtp_num_layers
++    model_cfg.mtp_loss_scaling_factor = cfg.model.mtp_loss_scaling_factor
++    model_cfg.use_symmetric_memory_p2p = cfg.model.use_symmetric_memory_p2p
++
++    # --- Model Configuration ---
++    config.ddp = override_ddp_config(hydra_config=cfg, ddp_config=config.ddp)
++    config.comm_overlap = override_comm_overlap_config(hydra_config=cfg, comm_overlap_config=config.comm_overlap)
++    config.dist = override_dist_config(hydra_config=cfg, dist_config=config.dist)
++    config.checkpoint = override_checkpoint_config(hydra_config=cfg, checkpoint_config=config.checkpoint)
++    config.checkpoint.load_main_params_from_ckpt = cfg.optim.fp8_param_gather or config.mixed_precision.fp4_param_gather
++
++    # Apply architecture overrides from model variant config
++    arch_overrides = OmegaConf.select(cfg.model, 'architecture_overrides')
++    if arch_overrides:
++        for param, value in arch_overrides.items():
++            # Convert OmegaConf containers to native Python types for Megatron compatibility
++            if OmegaConf.is_config(value):
++                value = OmegaConf.to_container(value, resolve=True)
++            setattr(model_cfg, param, value)
++
++
++
++    if model_cfg.virtual_pipeline_model_parallel_size == "null" or model_cfg.virtual_pipeline_model_parallel_size == 0:
++        model_cfg.virtual_pipeline_model_parallel_size = None
++
++    # --- Parallelism Settings ---
++    model_cfg.tensor_model_parallel_size = cfg.model.tensor_model_parallel_size
++    model_cfg.pipeline_model_parallel_size = cfg.model.pipeline_model_parallel_size
++    model_cfg.virtual_pipeline_model_parallel_size = cfg.model.virtual_pipeline_model_parallel_size
++    model_cfg.context_parallel_size = cfg.model.context_parallel_size
++    model_cfg.expert_model_parallel_size = cfg.model.expert_model_parallel_size
++    model_cfg.expert_tensor_parallel_size = cfg.model.expert_tensor_parallel_size
++    model_cfg.sequence_parallel = cfg.model.tensor_model_parallel_size > 1
++    set_deepseek_v3_pipeline_model_parallel_layout(model_cfg, cfg.model.pipeline_layout)
++
++    # --- Model Settings ---
++    model_cfg.seq_length = cfg.model.encoder_seq_length
++    model_cfg.seed = cfg.model.seed
++    model_cfg.te_rng_tracker = cfg.model.use_rng_tracker
++
++    # --- Fusions ---
++    model_cfg.fused_residual_rmsnorm = cfg.model.fused_residual_rmsnorm
++    model_cfg.use_te_activation_func = cfg.model.use_te_activation_func
++    if cfg.model.use_te_activation_func:
++        model_cfg.bias_activation_fusion = False
++
++    # --- MoE Settings ---
++    model_cfg.moe_token_dispatcher_type = cfg.model.moe_token_dispatcher_type
++    model_cfg.moe_grouped_gemm = cfg.model.moe_grouped_gemm
++    model_cfg.moe_single_grouped_weight = cfg.model.moe_single_grouped_weight
++    model_cfg.moe_single_grouped_bias = cfg.model.moe_single_grouped_bias
++    model_cfg.moe_permute_fusion = cfg.model.moe_permute_fusion
++    model_cfg.moe_router_fusion = cfg.model.moe_router_fusion
++    model_cfg.overlap_dispatch_backward_with_experts_wgrad = cfg.model.overlap_dispatch_backward_with_experts_wgrad
++    model_cfg.moe_router_force_load_balancing = cfg.model.moe_router_force_load_balancing
++    model_cfg.moe_router_force_biased = cfg.model.moe_router_force_biased
++    if cfg.model.moe_expert_rank_capacity_factor is not None:
++        model_cfg.moe_expert_rank_capacity_factor = cfg.model.moe_expert_rank_capacity_factor
++    model_cfg.moe_paged_stash = cfg.model.moe_paged_stash
++    if cfg.model.moe_paged_stash_buffer_size_factor_cuda is not None:
++        model_cfg.moe_paged_stash_buffer_size_factor_cuda = float(
++            cfg.model.moe_paged_stash_buffer_size_factor_cuda
++        )
++    if cfg.model.moe_paged_stash_buffer_size_factor_cpu is not None:
++        model_cfg.moe_paged_stash_buffer_size_factor_cpu = float(
++            cfg.model.moe_paged_stash_buffer_size_factor_cpu
++        )
++    model_cfg.log_moe_overload_factor = cfg.model.log_moe_overload_factor
++    model_cfg.moe_aux_loss_coeff = cfg.model.moe_aux_loss_coeff
++    model_cfg.apply_rope_fusion = cfg.model.apply_rope_fusion
++    model_cfg.moe_router_dtype = cfg.model.moe_router_dtype
++    model_cfg.moe_hybridep_num_sms = cfg.model.moe_hybridep_num_sms
++    model_cfg.moe_hybridep_num_sms_preprocessing = cfg.model.moe_hybridep_num_sms_preprocessing
++    model_cfg.high_priority_a2a_comm_stream = cfg.model.high_priority_a2a_comm_stream
++    apply_flex_dispatcher_backend(model_cfg, cfg.model.moe_flex_dispatcher_backend)
++    model_cfg.fp8_output_proj = cfg.model.fp8_output_proj
++
++    # CPU activation offloading config
++    model_cfg.cpu_offloading = cfg.model.cpu_offloading
++    model_cfg.cpu_offloading_num_layers = cfg.model.cpu_offloading_num_layers
++    model_cfg.cpu_offloading_weights = False
++
++    # Fine-grained activation offloading config
++    model_cfg.fine_grained_activation_offloading = cfg.model.fine_grained_activation_offloading
++    model_cfg.offload_modules = cfg.model.offload_modules.split(",") if cfg.model.offload_modules else []
++    model_cfg.min_offloaded_tensor_size = cfg.model.min_offloaded_tensor_size
++    if cfg.model.fine_grained_offloading_max_inflight_offloads is not None:
++        model_cfg.fine_grained_offloading_max_inflight_offloads = int(
++            cfg.model.fine_grained_offloading_max_inflight_offloads
++        )
++
++    # Pinned CPU buffers are retained after offloading and reused for the
++    # next iteration. It is useful for cuda graph capture.
++    model_cfg.cpu_offloading_retain_pinned_cpu_buffers = cfg.model.cpu_offloading_retain_pinned_cpu_buffers
++
++    # Gradient accumulation fusion
++    model_cfg.gradient_accumulation_fusion = cfg.model.gradient_accumulation_fusion
++
++    # FSDP config parameters
++    model_cfg.init_model_with_meta_device = cfg.model.mcore_fsdp
++    model_cfg.moe_router_topk = cfg.model.moe_router_topk
++    model_cfg.moe_router_num_groups = cfg.model.moe_router_num_groups
++    model_cfg.moe_router_group_topk = cfg.model.moe_router_group_topk
++    model_cfg.moe_router_topk_scaling_factor = cfg.model.moe_router_topk_scaling_factor
++
++    # Handle recompute modules.
++    # Set recompute_granularity to None if no modules are specified.
++    model_cfg.recompute_modules = cfg.model.recompute_modules.split(",") if cfg.model.recompute_modules else []
++    if not model_cfg.recompute_modules:
++        model_cfg.recompute_granularity = None
++
++    # CUDA graph settings
++    cuda_graph_impl = cfg.model.cuda_graph_implementation
++    if cuda_graph_impl:
++        model_cfg.cuda_graph_impl = cuda_graph_impl
++    set_cuda_graph_modules(
++        model_cfg,
++        _normalize_cuda_graph_modules(cfg.model.cuda_graph_modules),
++    )
++    if cfg.model.cuda_graph_warmup_steps is not None:
++        model_cfg.cuda_graph_warmup_steps = cfg.model.cuda_graph_warmup_steps
++    if cfg.model.use_dynamic_comp_stream:
++        model_cfg.use_dynamic_comp_stream = cfg.model.use_dynamic_comp_stream
++
++
++    # Fusion optimizations
++    model_cfg.use_transformer_engine_op_fuser = cfg.model.use_transformer_engine_op_fuser
++    model_cfg.mla_down_proj_fusion = cfg.model.mla_down_proj_fusion
++    if model_cfg.use_transformer_engine_op_fuser:
++        # CuTe DSL grouped GEMM + SwiGLU kernel expects block interleaved layout
++        model_cfg.moe_mlp_glu_interleave_size = 32
++    if (cfg.model.fp8 or cfg.model.fp4) and model_cfg.moe_flex_dispatcher_backend != "hybridep":
++        # Fused MoE router + padding
++        model_cfg.moe_router_padding_for_quantization = True
++
++    # --- Training Configuration ---
++    train_cfg = config.train
++    train_cfg.global_batch_size = cfg.model.global_batch_size
++    train_cfg.micro_batch_size = cfg.model.micro_batch_size
++    train_cfg.train_iters = cfg.trainer.max_steps
++    train_cfg.eval_interval = cfg.trainer.val_check_interval
++    train_cfg.eval_iters = cfg.trainer.limit_val_batches
++
++    # --- Validation Configuration ---
++    validation_cfg = config.validation
++    validation_cfg.eval_global_batch_size = cfg.trainer.eval_batch_size
++
++    # --- Optimizer Configuration ---
++    optimizer_cfg = config.optimizer
++    optimizer_cfg.lr = cfg.optim.lr
++    optimizer_cfg.min_lr = cfg.optim.min_lr
++    optimizer_cfg.adam_eps = cfg.optim.adam_eps
++    optimizer_cfg.use_precision_aware_optimizer = cfg.optim.use_precision_aware_optimizer
++    if not cfg.optim.use_precision_aware_optimizer:
++        optimizer_cfg.main_grads_dtype=torch.float32
++        optimizer_cfg.exp_avg_dtype=torch.float32
++        optimizer_cfg.exp_avg_sq_dtype=torch.float32
++    else:
++        config.ddp.megatron_fsdp_use_decoupled_grad = True
++    optimizer_cfg.optimizer_cuda_graph = cfg.optim.optimizer_cuda_graph
++    optimizer_cfg.overlap_param_gather = cfg.optim.overlap_param_gather
++    optimizer_cfg.on_device_clip_grad = cfg.optim.on_device_clip_grad
++
++    # --- Scheduler Configuration ---
++    scheduler_cfg = config.scheduler
++    if cfg.trainer.max_steps <= cfg.optim.sched.lr_warmup_iters:
++        scheduler_cfg.lr_warmup_iters = max(cfg.trainer.max_steps // 2, 1)
++    else:
++        scheduler_cfg.lr_warmup_iters = cfg.optim.sched.lr_warmup_iters
++    scheduler_cfg.lr_decay_iters = cfg.optim.sched.lr_decay_iters
++
++    # --- RNG Configuration ---
++    rng_cfg = config.rng
++    rng_cfg.seed = cfg.model.seed
++    rng_cfg.te_rng_tracker = cfg.model.use_rng_tracker
++
++    # --- Dataset Configuration ---
++    config.dataset = get_data(cfg)
++
++    # --- Tokenizer Configuration ---
++    config.tokenizer = get_tokenizer_config(cfg)
++
++    config.logger = override_logger_config(cfg, config.logger)
++
++    # set up profiling config
++    config.profiling = get_profiling_config(cfg)
++
++    override_performance_configs(config)
++
++
++    return config
++
++
++@hydra.main(config_path="conf", config_name="deepseekv3_671b", version_base="1.2")
++def main(cfg):
++    init_logging()
++    OmegaConf.resolve(cfg)
++    config = create_config(cfg)
++
++    if get_rank() == 0:
++        log_hyperparams(cfg, config)
++        mllogger.start(key=mllogger.constants.INIT_START)
++
++    callbacks = [DeltaTimingCallback(cfg), MLPerfLoggingCallback(cfg)]
++    if cfg.trainer.warmup_train_steps > 0:
++        callbacks.insert(0, WarmupCallback(cfg, forward_step_func=forward_step))
++    # EvalCPCallback must fire before WarmupCallback's on_data_init_start so
++    # the eval pg_collection is built before warmup's validation pass tries
++    # to query it. Insert at index 0 AFTER WarmupCallback insertion so the
++    # final order is [EvalCPCallback, WarmupCallback, ...].
++    if cfg.trainer.eval_context_parallel_size is not None:
++        callbacks.insert(0, EvalCPCallback(eval_cp_size=cfg.trainer.eval_context_parallel_size))
++    if cfg.model.nsys_profile.memory_profiler.enable:
++        pytorch_profile_dir = os.path.join(cfg.exp_manager.explicit_log_dir, "pytorch_profile")
++        ranks_str = cfg.model.nsys_profile.ranks_str or "0"
++        profile_ranks = [int(x.strip()) for x in ranks_str.split(",") if x.strip()]
++        mem_cfg = cfg.model.nsys_profile.memory_profiler
++        mem_start = _parse_memory_profiler_step(mem_cfg.start_step)
++        mem_end = _parse_memory_profiler_step(mem_cfg.end_step)
++        memory_callback = MemoryProfileCallback(
++            enabled=True,
++            file_prefix=mem_cfg.file_prefix,
++            output_dir=pytorch_profile_dir,
++            max_entries=1000000,
++            profile_ranks=profile_ranks,
++            start_step=mem_start,
++            end_step=mem_end,
++            force_oom_before_stop=False,
++        )
++        # Register first so on_train_start runs before WarmupCallback: _record_memory_history must
++        # be active during warmup / graph capture (full-iteration CUDA graph), not only after it.
++        callbacks.insert(0, memory_callback)
++
++    if os.getenv("NTRACE_ENABLE", "0") == "1":
++        try:
++            from ntrace import NtraceCallback
++        except ModuleNotFoundError as exc:
++            if exc.name != "ntrace":
++                raise
++            if utils.rank == 0:
++                print("NTRACE_ENABLE=1 but ntrace is not installed; skipping NtraceCallback", flush=True)
++        else:
++            callbacks.append(NtraceCallback())
++
++    # GC Config
++    config.train.manual_gc = True
++    config.train.manual_gc_interval = 500
++    config.train.manual_gc_eval = False
++
++    # Memory management
++    config.train.empty_unused_memory_level = 0
++    config.train.train_sync_interval = None
++
++    # Skip numeric checks
++    config.train.check_optimizer_step_success = False
++    config.train.exit_signal_handler = False
++
++    apply_torch_cuda_graph_autograd_settings(cfg)
++
++    try:
++        pretrain(config, forward_step_func=forward_step, callbacks=callbacks)
++    except Exception:
++        for callback in callbacks:
++            cleanup = getattr(callback, "cleanup_after_oom", None)
++            if callable(cleanup):
++                try:
++                    callback.cleanup_after_oom()
++                except Exception:
++                    pass
++        raise
++
++if __name__ == "__main__":
++    main()
+diff --git a/examples/zero_sm_pp/deepseek_mlperf/utils.py b/examples/zero_sm_pp/deepseek_mlperf/utils.py
+new file mode 100755
+index 000000000..b3573d703
+--- /dev/null
++++ b/examples/zero_sm_pp/deepseek_mlperf/utils.py
+@@ -0,0 +1,50 @@
++# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++import os
++import logging
++
++from functools import wraps
++
++from megatron.bridge.utils.common_utils import is_last_rank
++
++
++def get_rank():
++    return int(os.getenv("SLURM_PROCID", 0))
++
++
++def rank_last(func):
++    @wraps(func)
++    def wrapper(*args, **kwargs):
++        if is_last_rank():
++            return func(*args, **kwargs)
++    return wrapper
++
++
++class RankZeroFilter(logging.Filter):
++    def filter(self, record):
++        return get_rank() == 0
++
++
++def init_logging():
++    root = logging.getLogger()
++    root.addFilter(RankZeroFilter())
++
++    l = logging.getLogger("megatron.core.dist_checkpointing.validation")
++    l.setLevel(logging.DEBUG)
++    h = logging.StreamHandler()
++    h.setLevel(logging.DEBUG)
++    h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
++    l.addHandler(h)
++    l.propagate = False  # prevent duplicate logs if root has handlers
+diff --git a/megatron/core/distributed/param_and_grad_buffer.py b/megatron/core/distributed/param_and_grad_buffer.py
+index 1e88bf8dd..059dbde09 100644
+--- a/megatron/core/distributed/param_and_grad_buffer.py
++++ b/megatron/core/distributed/param_and_grad_buffer.py
+@@ -947,6 +947,36 @@ def _compute_default_per_buffer_param_layout(
+     )
+ 
+ 
++_NCCL_UB_WARMUP_DONE = False
++
++
++def _serialized_nccl_ub_warmup(data_parallel_group):
++    """Count-consistent NCCL user-buffer warmup for pipeline parallelism.
++
++    Every rank inventories all data-parallel groups over the default group and
++    initializes them one at a time in a fixed global order, so all ranks run the
++    same number of global barriers and no two groups create NCCL resources
++    concurrently. Runs once per process.
++    """
++    global _NCCL_UB_WARMUP_DONE
++    if _NCCL_UB_WARMUP_DONE:
++        return
++    _NCCL_UB_WARMUP_DONE = True
++
++    my_ranks = tuple(torch.distributed.get_process_group_ranks(data_parallel_group))
++    gathered = [None] * torch.distributed.get_world_size()
++    torch.distributed.all_gather_object(gathered, my_ranks)
++    inventory = sorted({tuple(entry) for entry in gathered})
++
++    my_rank = torch.distributed.get_rank()
++    for ranks in inventory:
++        torch.distributed.barrier()
++        if my_rank in ranks:
++            tmp_warmup_tensor = torch.zeros([1], device="cuda")
++            torch.distributed.all_reduce(tmp_warmup_tensor, group=data_parallel_group)
++        torch.distributed.barrier()
++
++
+ class _ParamAndGradBuffer:
+     """
+     Groups parameters and gradients into a contiguous buffer, and then breaks the buffer into
+@@ -1090,10 +1120,7 @@ class _ParamAndGradBuffer:
+             )
+             # Since nccl communicator group is created lazily, we need to perform a warmup call to
+             # initialize NCCL comm buffers for this dp_group before doing buffer registration.
+-            torch.distributed.barrier()
+-            tmp_warmup_tensor = torch.zeros([1], device="cuda")
+-            torch.distributed.all_reduce(tmp_warmup_tensor, group=self.data_parallel_group)
+-            torch.distributed.barrier()
++            _serialized_nccl_ub_warmup(self.data_parallel_group)
+         else:
+             # If nccl_ub is False, mem_alloc_context is nullcontext.
+             mem_alloc_context = nullcontext
+diff --git a/megatron/core/optimizer/optimizer.py b/megatron/core/optimizer/optimizer.py
+index 4a74328d0..9d7db1b64 100644
+--- a/megatron/core/optimizer/optimizer.py
++++ b/megatron/core/optimizer/optimizer.py
+@@ -1728,7 +1728,11 @@ class ChainedOptimizer(MegatronOptimizer):
+                         use_decoupled_grad=use_decoupled_grad,
+                     )
+ 
+-            if grad_norm > optimizer.config.grad_norm_skip_threshold and main_params:
++            if (
++                not optimizer.config.optimizer_cuda_graph
++                and grad_norm > optimizer.config.grad_norm_skip_threshold
++                and main_params
++            ):
+                 log_single_rank(
+                     logger, logging.INFO, "skipping grad norm because it's too large %s", grad_norm
+                 )

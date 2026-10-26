@@ -1,0 +1,16 @@
+diff --git a/megatron/core/transformer/moe/shared_experts.py b/megatron/core/transformer/moe/shared_experts.py
+index 8fc7876bf..0ef2172cc 100644
+--- a/megatron/core/transformer/moe/shared_experts.py
++++ b/megatron/core/transformer/moe/shared_experts.py
+@@ -186,6 +186,11 @@ class SharedExpertMLP(MLP):
+                 self.__class__.stream = torch.cuda.Stream()
+             self.stream = self.__class__.stream
+ 
++    def reset_parameters(self):
++        # FSDP meta init resets direct parameters; child linears reset themselves.
++        if self.gate_weight is not None:
++            self.config.init_method(self.gate_weight)
++
+     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+         """Forward function"""
+         output, _ = super().forward(hidden_states)

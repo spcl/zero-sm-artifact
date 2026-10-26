@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Zhenhao He <zhenhaoh@nvidia.com>
+Date: Mon, 27 Jul 2026 06:14:17 -0700
+Subject: [PATCH 9/9] Rename internal RMA context symbols
+
+Signed-off-by: Zhenhao He <zhenhaoh@nvidia.com>
+---
+ src/ce_coll.cc              |  8 ++++----
+ src/include/rma/rma_proxy.h |  8 ++++----
+ src/rma/rma_proxy.cc        | 10 +++++-----
+ 3 files changed, 13 insertions(+), 13 deletions(-)
+
+diff --git a/src/ce_coll.cc b/src/ce_coll.cc
+index 48f143e5d..e06b12bbc 100644
+--- a/src/ce_coll.cc
++++ b/src/ce_coll.cc
+@@ -1165,7 +1165,7 @@ bool ncclHierCeAvailable(struct ncclComm* comm, ncclFunc_t coll, int /*ncclDevRe
+   // the rail step (provisioned under exactly this path's guard conditions). This
+   // is independent of the user's config.numRmaCtx -- the rail uses the internal
+   // context range, so numRmaCtx == 0 is fine.
+-  if (!comm->hostRmaSupport || !ncclRmaWantInternalCtx(comm)) {
++  if (!comm->hostRmaSupport || !ncclRmaNeedIntCtxs(comm)) {
+     TRACE(NCCL_TUNING, "Skipping hierarchical CE collective: RMA proxy not available");
+     return false;
+   }
+@@ -1335,7 +1335,7 @@ static void ncclHierCollFreeChunkPlan(struct ncclHierChunkPlan* plan) {
+ 
+ // Effective number of internal contexts for a hierarchical collective's rail
+ static int ncclHierCollNumCtx(struct ncclRmaProxyState* rmaProxyState, size_t perPeerBytes, bool persistent) {
+-  int numCtx = rmaProxyState->numIntCtx;
++  int numCtx = rmaProxyState->numRmaIntCtx;
+   int64_t numCtxOverride = ncclParamHierCeCollNumCtx();
+   if (numCtxOverride > 0) {
+     if (numCtxOverride > numCtx) {
+@@ -1631,7 +1631,7 @@ static ncclResult_t ncclHierCeAllGatherDirect(struct ncclComm* comm, struct nccl
+   ncclResult_t ret = ncclSuccess;
+ 
+   // Distribute the cross-node rail puts/waits across the NCCL-internal RMA proxy
+-  // contexts [numRmaCtx, numRmaCtx + numIntCtx); the user-addressable contexts
++  // contexts [numRmaCtx, numRmaCtx + numRmaIntCtx); the user-addressable contexts
+   // [0, numRmaCtx) are never touched by the collective. baseCtx is the first
+   // internal context, and chunk-local index j maps to context baseCtx + j%numCtx.
+   // Both ranks build the same chunk plan, so sender and receiver agree on each
+@@ -2716,7 +2716,7 @@ ncclResult_t ncclHierCeAlltoAll(struct ncclComm* comm, struct ncclKernelPlan* pl
+   ncclResult_t ret = ncclSuccess;
+ 
+   // Distribute the cross-node rail puts/waits across the NCCL-internal RMA proxy
+-  // contexts [numRmaCtx, numRmaCtx + numIntCtx); the user-addressable contexts
++  // contexts [numRmaCtx, numRmaCtx + numRmaIntCtx); the user-addressable contexts
+   // [0, numRmaCtx) are never touched by the collective. baseCtx is the first
+   // internal context, and chunk-local index j maps to context baseCtx + j%numCtx.
+   // Both ranks build the same chunk plan, so sender and receiver agree on each
+diff --git a/src/include/rma/rma_proxy.h b/src/include/rma/rma_proxy.h
+index b232e17c8..ed3a0e7cc 100644
+--- a/src/include/rma/rma_proxy.h
++++ b/src/include/rma/rma_proxy.h
+@@ -186,10 +186,10 @@ struct ncclRmaProxyState {
+ 
+   // Virtual RMA proxy contexts. The array holds the user-addressable contexts
+   // [0, numRmaCtx) followed by NCCL-internal contexts [numRmaCtx, numRmaCtx +
+-  // numIntCtx) used by the hierarchical CE collectives' rail step. numIntCtx is
++  // numRmaIntCtx) used by the hierarchical CE collectives' rail step. numRmaIntCtx is
+   // 0 unless the internal-context guard holds (see ncclRmaProxyConnectOnce).
+-  int rmaProxyCtxCount;       // total = numRmaCtx + numIntCtx
+-  int numIntCtx;              // total count of internal contexts
++  int rmaProxyCtxCount;       // total = numRmaCtx + numRmaIntCtx
++  int numRmaIntCtx;           // total count of internal contexts
+   void** rmaProxyCtxs;
+   int rmaProgress;         // RMA progress is enabled
+   std::thread thread;
+@@ -208,7 +208,7 @@ ncclResult_t ncclRmaProxyConnectOnce(struct ncclComm* comm);
+ ncclResult_t ncclRmaProxyFinalize(struct ncclComm* comm);
+ 
+ // True when the communicator needs internal RMA contexts for hierarchical collectives
+-bool ncclRmaWantInternalCtx(struct ncclComm* comm);
++bool ncclRmaNeedIntCtxs(struct ncclComm* comm);
+ 
+ // RMA Proxy context management
+ ncclResult_t ncclRmaProxyCreateContext(struct ncclComm* comm, void* collComm, ncclNetProperties_t props,
+diff --git a/src/rma/rma_proxy.cc b/src/rma/rma_proxy.cc
+index f1ef4967f..b29f585fd 100644
+--- a/src/rma/rma_proxy.cc
++++ b/src/rma/rma_proxy.cc
+@@ -391,7 +391,7 @@ void* ncclRmaProxyProgressThread(struct ncclRmaProxyState* rmaProxyState_) {
+ // Return whether this communicator needs internal RMA contexts for the
+ // hierarchical CE collectives' inter-node rail: zero-CTA policy, multiple LSA
+ // teams, and more than one node.
+-bool ncclRmaWantInternalCtx(struct ncclComm* comm) {
++bool ncclRmaNeedIntCtxs(struct ncclComm* comm) {
+   return (comm->config.CTAPolicy & NCCL_CTA_POLICY_ZERO) && !ncclDevrIsOneLsaTeam(comm) && comm->nNodes > 1;
+ }
+ 
+@@ -464,16 +464,16 @@ ncclResult_t ncclRmaProxyConnectOnce(struct ncclComm* comm) {
+ 
+   // Create virtual RMA proxy contexts. The array is laid out as the
+   // user-addressable contexts [0, numRmaCtx) followed by NCCL-internal contexts
+-  // [numRmaCtx, numRmaCtx + numIntCtx) for the hierarchical CE collectives. The
++  // [numRmaCtx, numRmaCtx + numRmaIntCtx) for the hierarchical CE collectives. The
+   // internal range is provisioned only when needed (ncclNumRmaIntCtx() contexts
+   // total, distributed across the physical RMA communicators), so it stays empty
+   // on paths that don't use it.
+-  rmaProxyState->numIntCtx = ncclRmaWantInternalCtx(comm) ? ncclNumRmaIntCtx() : 0;
+-  rmaProxyState->rmaProxyCtxCount = comm->config.numRmaCtx + rmaProxyState->numIntCtx;
++  rmaProxyState->numRmaIntCtx = ncclRmaNeedIntCtxs(comm) ? ncclNumRmaIntCtx() : 0;
++  rmaProxyState->rmaProxyCtxCount = comm->config.numRmaCtx + rmaProxyState->numRmaIntCtx;
+   NCCLCHECK(ncclCalloc(&rmaProxyState->rmaProxyCtxs, rmaProxyState->rmaProxyCtxCount));
+   for (int n = 0; n < rmaProxyState->rmaProxyCtxCount; n++) {
+     // Both ranges map round-robin to the physical RMA communicators; the
+-    // internal range spreads its numIntCtx contexts across them.
++    // internal range spreads its numRmaIntCtx contexts across them.
+     int collCommIdx = (n < comm->config.numRmaCtx ? n : n - comm->config.numRmaCtx) % rmaProxyState->rmaCommCount;
+     NCCLCHECKGOTO(ncclRmaProxyCreateContext(comm, rmaProxyState->rmaComms[collCommIdx],
+                                             rmaProxyState->props[collCommIdx], collCommIdx,

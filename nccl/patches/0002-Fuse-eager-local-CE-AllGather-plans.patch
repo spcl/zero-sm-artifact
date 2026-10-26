@@ -1,0 +1,289 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Siyuan Shen <siyshen@nvidia.com>
+Date: Mon, 17 Aug 2026 15:08:11 -0700
+Subject: [PATCH 2/9] Fuse eager local CE AllGather plans
+
+Signed-off-by: Siyuan Shen <siyshen@nvidia.com>
+---
+ src/ce_coll.cc | 197 +++++++++++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 190 insertions(+), 7 deletions(-)
+
+diff --git a/src/ce_coll.cc b/src/ce_coll.cc
+index 3d93168c5..b9376aefe 100644
+--- a/src/ce_coll.cc
++++ b/src/ce_coll.cc
+@@ -32,6 +32,11 @@ NCCL_PARAM(CeMemcpyOverlapEnable, "CE_INTRA_GPU_MEMCPY_ENABLE", 1);
+ // descriptors have persistent lifetimes that must remain independently owned.
+ NCCL_PARAM(CeCollPlanAgBatch, "CE_COLL_PLAN_AG_BATCH", 1);
+ 
++// Share the synchronization envelope and copy submission for consecutive
++// eager, LSA-local AllGathers already packed into one plan. Keep protocol
++// fusion independent from plan packing and opt-in until enabled by tuning.
++NCCL_PARAM(CeAllGatherPlanFusion, "CE_ALLGATHER_PLAN_FUSION", 0);
++
+ // Bound both scoped-memory consumption and the amount of work executed by one
+ // plan callback when a user provides an excessively large environment value.
+ static constexpr int CE_COLL_PLAN_AG_BATCH_MAX = 64;
+@@ -47,6 +52,58 @@ static inline struct ncclCeCollArgs* ncclCePlanActiveArgs(struct ncclKernelPlan*
+   return &plan->ceCollArgs[plan->ceCollIndex];
+ }
+ 
++static bool ncclCeRangesOverlap(const void* a, size_t aBytes, const void* b, size_t bBytes) {
++  if (aBytes == 0 || bBytes == 0) return false;
++  uintptr_t aBegin = reinterpret_cast<uintptr_t>(a);
++  uintptr_t bBegin = reinterpret_cast<uintptr_t>(b);
++  uintptr_t aEnd = aBegin + aBytes;
++  uintptr_t bEnd = bBegin + bBytes;
++  // An overflowing range is not safe to reason about, so make the fusion
++  // eligibility check fail closed.
++  if (aEnd < aBegin || bEnd < bBegin) return true;
++  return aBegin < bEnd && bBegin < aEnd;
++}
++
++// cudaMemcpyBatchAsync does not order copies within a batch. Preserve the
++// observable order of grouped NCCL calls by fusing only AllGathers whose
++// output ranges are independent from every other member's inputs and outputs.
++// Read-only send ranges may overlap each other.
++static bool ncclCeAllGatherPlanBuffersIndependent(struct ncclComm* comm, struct ncclKernelPlan* plan) {
++  for (int i = 0; i < plan->nCeColls; i++) {
++    struct ncclCeCollArgs* a = &plan->ceCollArgs[i];
++    size_t aSendBytes = a->nElts * a->eltSize;
++    if (a->eltSize != 0 && aSendBytes / a->eltSize != a->nElts) return false;
++    size_t aRecvBytes = aSendBytes * comm->nRanks;
++    if (comm->nRanks != 0 && aRecvBytes / comm->nRanks != aSendBytes) return false;
++
++    for (int j = 0; j < i; j++) {
++      struct ncclCeCollArgs* b = &plan->ceCollArgs[j];
++      size_t bSendBytes = b->nElts * b->eltSize;
++      if (b->eltSize != 0 && bSendBytes / b->eltSize != b->nElts) return false;
++      size_t bRecvBytes = bSendBytes * comm->nRanks;
++      if (comm->nRanks != 0 && bRecvBytes / comm->nRanks != bSendBytes) return false;
++
++      if (ncclCeRangesOverlap(a->recvBuff, aRecvBytes, b->recvBuff, bRecvBytes) ||
++          ncclCeRangesOverlap(a->sendBuff, aSendBytes, b->recvBuff, bRecvBytes) ||
++          ncclCeRangesOverlap(a->recvBuff, aRecvBytes, b->sendBuff, bSendBytes)) {
++        return false;
++      }
++    }
++  }
++  return true;
++}
++
++static bool ncclCeAllGatherUsePlanFusion(struct ncclComm* comm, struct ncclKernelPlan* plan) {
++  if (plan->persistent || plan->nCeColls < 2 || ncclParamCeAllGatherPlanFusion() == 0 ||
++      !ncclDevrIsOneLsaTeam(comm)) {
++    return false;
++  }
++  for (int i = 0; i < plan->nCeColls; i++) {
++    if (plan->ceCollArgs[i].func != ncclFuncAllGather) return false;
++  }
++  return ncclCeAllGatherPlanBuffersIndependent(comm, plan);
++}
++
+ // Static constants for intra-batch synchronization to improve CE collective performance with large scale
+ // Frequency of intra-batch synchronization
+ static const uint32_t CE_COLL_INTRA_BATCH_SYNC_FREQ = 8;
+@@ -325,11 +382,22 @@ fail:
+   goto exit;
+ }
+ 
+-// Intra-LSA-rank synchronization through memory operations.
+-ncclResult_t ncclMemOpSync(struct ncclComm* comm, cudaStream_t stream, struct ncclCeCollArgs* profilerArgs) {
++static size_t ncclMemOpSyncBatchCapacity(struct ncclComm* comm) {
++  bool useMCSync = comm->symkState.hasLsaMultimem;
++  return (useMCSync ? NCCL_CE_SYNC_OPS_PER_RANK_MC : NCCL_CE_SYNC_OPS_PER_RANK_UC) *
++         comm->devrState.lsaSize;
++}
++
++// Intra-LSA-rank synchronization through memory operations. A fused eager
++// plan may supply scoped descriptor storage; the driver consumes these host
++// descriptors during ncclCuStreamBatchMemOp, before this function returns.
++static ncclResult_t ncclMemOpSyncWithScratch(struct ncclComm* comm, cudaStream_t stream,
++                                             struct ncclCeCollArgs* profilerArgs,
++                                             CUstreamBatchMemOpParams* batchParams) {
+   ncclResult_t ret = ncclSuccess;
+   void* ceSyncHandle = NULL;
+   int lsaSize = comm->devrState.lsaSize;
++  bool ownsBatchParams = batchParams == nullptr;
+ 
+   // Get pointers to the ready and complete synchronization arrays
+   uint32_t* readyPtrs = (uint32_t*)comm->ceColl.baseUCSymReadyPtr;
+@@ -338,15 +406,14 @@ ncclResult_t ncclMemOpSync(struct ncclComm* comm, cudaStream_t stream, struct nc
+   // Allocate enough slots for all possible ops
+   // We follow the built-in symmetric kernels on whether to use NVLS or not.
+   bool useMCSync = comm->symkState.hasLsaMultimem;
+-  size_t batchSize = (useMCSync ? NCCL_CE_SYNC_OPS_PER_RANK_MC : NCCL_CE_SYNC_OPS_PER_RANK_UC) * lsaSize;
++  size_t batchSize = ncclMemOpSyncBatchCapacity(comm);
+   size_t opIdx = 0;
+-  CUstreamBatchMemOpParams* batchParams = nullptr;
+ 
+   // Start CE sync profiling (no-op if profilerArgs is nullptr)
+   NCCLCHECKGOTO(ncclProfilerStartCeSyncEvent(comm, profilerArgs, stream, &ceSyncHandle), ret, fail);
+ 
+   // Prepare batch memory operations for synchronization
+-  NCCLCHECKGOTO(ncclCalloc(&batchParams, batchSize), ret, fail);
++  if (ownsBatchParams) NCCLCHECKGOTO(ncclCalloc(&batchParams, batchSize), ret, fail);
+ 
+   if (useMCSync) {
+     NCCLCHECKGOTO(ncclPrepMCSync(comm, comm->ceColl.useCompletePtr, batchParams, &opIdx, stream), ret, fail);
+@@ -376,12 +443,16 @@ ncclResult_t ncclMemOpSync(struct ncclComm* comm, cudaStream_t stream, struct nc
+ exit:
+   // Stop CE sync profiling - always attempt if started, even on error
+   ncclProfilerStopCeSyncEvent(comm, ceSyncHandle, stream);
+-  if (batchParams) free(batchParams);
++  if (ownsBatchParams && batchParams) free(batchParams);
+   return ret;
+ fail:
+   goto exit;
+ }
+ 
++ncclResult_t ncclMemOpSync(struct ncclComm* comm, cudaStream_t stream, struct ncclCeCollArgs* profilerArgs) {
++  return ncclMemOpSyncWithScratch(comm, stream, profilerArgs, nullptr);
++}
++
+ ncclResult_t ncclCeInitBatchOpsParams(struct ncclCeBatchOpsParams* params, int capacity) {
+   ncclResult_t ret = ncclSuccess;
+ 
+@@ -501,6 +572,23 @@ fail:
+ }
+ #endif
+ 
++// Eager plan callbacks finish before ncclGroupCommLeave() releases memScoped.
++// Use that lifetime for launch-only copy arrays instead of allocating and
++// freeing several small heap blocks on every group submission.
++static void ncclCeInitBatchOpsParamsScoped(struct ncclComm* comm, struct ncclCeBatchOpsParams* params,
++                                           int capacity) {
++  params->srcs = ncclMemoryStackAlloc<void*>(&comm->memScoped, capacity);
++  params->dsts = ncclMemoryStackAlloc<void*>(&comm->memScoped, capacity);
++  params->sizes = ncclMemoryStackAlloc<size_t>(&comm->memScoped, capacity);
++  params->numOps = 0;
++  params->intraBatchSync = false;
++#if CUDART_VERSION >= 12080
++  params->attrs = ncclMemoryStackAlloc<cudaMemcpyAttributes>(&comm->memScoped, capacity);
++  params->attrIdxs = ncclMemoryStackAlloc<size_t>(&comm->memScoped, capacity);
++  params->numAttrs = 0;
++#endif
++}
++
+ ncclResult_t ncclCeLaunchBatchOps(struct ncclComm* comm, struct ncclCeBatchOpsParams* params, cudaStream_t stream,
+                                   struct ncclCeCollArgs* profilerArgs) {
+   ncclResult_t ret = ncclSuccess;
+@@ -722,6 +810,81 @@ fail:
+   goto exit;
+ }
+ 
++// Append one independent copy to the fused plan and saturate the byte
++// accumulator used only for the existing intra-batch synchronization policy.
++static void ncclCeAllGatherPlanAppendCopy(struct ncclCeBatchOpsParams* ops, void* dst, void* src, size_t bytes,
++                                          size_t* totalBytes) {
++  ops->srcs[ops->numOps] = src;
++  ops->dsts[ops->numOps] = dst;
++  ops->sizes[ops->numOps] = bytes;
++  ops->numOps++;
++  *totalBytes = bytes > SIZE_MAX - *totalBytes ? SIZE_MAX : *totalBytes + bytes;
++}
++
++// Execute independent eager local AllGathers with one entry barrier, one copy
++// submission, and one completion barrier. Algorithm selection remains per
++// member: every AllGather independently uses the existing CE unicast or
++// multicast cost-model result.
++static ncclResult_t ncclCeAllGatherPlan(struct ncclComm* comm, struct ncclKernelPlan* plan, cudaStream_t stream) {
++  ncclResult_t ret = ncclSuccess;
++  int nTasks = plan->nCeColls;
++  int myLsaRank = comm->devrState.lsaSelf;
++  int lsaSize = comm->devrState.lsaSize;
++  size_t totalCopyBytes = 0;
++  bool hasUnicast = false;
++  struct ncclCeBatchOpsParams ops = {};
++  CUstreamBatchMemOpParams* syncOps =
++    ncclMemoryStackAlloc<CUstreamBatchMemOpParams>(&comm->memScoped, ncclMemOpSyncBatchCapacity(comm));
++
++  ncclCeInitBatchOpsParamsScoped(comm, &ops, nTasks * lsaSize);
++  plan->ceCollIndex = 0;
++  NCCLCHECKGOTO(ncclMemOpSyncWithScratch(comm, stream, &plan->ceCollArgs[0], syncOps), ret, fail);
++
++  for (int i = 0; i < nTasks; i++) {
++    struct ncclCeCollArgs* args = &plan->ceCollArgs[i];
++    size_t bytes = args->nElts * args->eltSize;
++    uint8_t* send = (uint8_t*)args->sendBuff;
++    uint8_t* selfDst = (uint8_t*)args->recvBuff + (size_t)myLsaRank * bytes;
++    size_t winOffset = selfDst - (uint8_t*)args->recvWin->userPtr;
++    bool multicast = ncclCeAllGatherUseMulticast(comm, bytes,
++                                                  ncclCudaGraphValid(comm->planner.capturingGraph),
++                                                  send == selfDst);
++
++    if (multicast) {
++      void* mcDst = nullptr;
++      NCCLCHECKGOTO(ncclDevrGetLsaTeamPtrMC(comm, args->recvWin, winOffset, ncclTeamLsa(comm), &mcDst), ret, fail);
++      ncclCeAllGatherPlanAppendCopy(&ops, mcDst, send, bytes, &totalCopyBytes);
++      continue;
++    }
++
++    hasUnicast = true;
++    if (send != selfDst) ncclCeAllGatherPlanAppendCopy(&ops, selfDst, send, bytes, &totalCopyBytes);
++    for (int r = 1; r < lsaSize; r++) {
++      int target = (myLsaRank + r) % lsaSize;
++      void* peerDst = nullptr;
++      NCCLCHECKGOTO(ncclDevrGetLsaRankPtr(comm, args->recvWin, winOffset, target, &peerDst), ret, fail);
++      ncclCeAllGatherPlanAppendCopy(&ops, peerDst, send, bytes, &totalCopyBytes);
++    }
++  }
++
++  ops.intraBatchSync = hasUnicast && ops.numOps > comm->ceColl.intraBatchSyncFreq &&
++                       totalCopyBytes >= comm->ceColl.intraBatchSyncMsgThreshold;
++  NCCLCHECKGOTO(ncclCeLaunchBatchOps(comm, &ops, stream, &plan->ceCollArgs[0]), ret, fail);
++  NCCLCHECKGOTO(ncclMemOpSyncWithScratch(comm, stream, &plan->ceCollArgs[0], syncOps), ret, fail);
++
++  if (comm->rank == 0) {
++    INFO(NCCL_TUNING,
++         "CE plan protocol-fused %d local AllGather tasks into %zu copy operations (scoped copy/sync scratch)",
++         nTasks, ops.numOps);
++  }
++
++exit:
++  plan->ceCollIndex = 0;
++  return ret;
++fail:
++  goto exit;
++}
++
+ // AlltoAll across the LSA team (intra-node only).
+ ncclResult_t ncclCeAlltoAll(struct ncclComm* comm, struct ncclCeCollArgs* args, cudaStream_t stream) {
+   ncclResult_t ret = ncclSuccess;
+@@ -2408,6 +2571,21 @@ ncclResult_t ncclLaunchCeColl(struct ncclComm* comm, struct ncclKernelPlan* plan
+   cudaStream_t stream = comm->planner.streams->stream;
+   struct ncclCeCollArgs* args = nullptr;
+   bool profilerStarted = false;
++  int fusedProfilerEvents = 0;
++
++  if (ncclCeAllGatherUsePlanFusion(comm, plan)) {
++    // A fused protocol is shared by all members. Keep every public collective
++    // represented in the profiler, while attaching the shared sync and batch
++    // child events to the first member as the plan representative.
++    for (int i = 0; i < plan->nCeColls; i++) {
++      plan->ceCollIndex = i;
++      NCCLCHECKGOTO(ncclProfilerStartCeCollEvent(comm, &plan->ceCollArgs[i], stream), ret, fail);
++      fusedProfilerEvents++;
++    }
++    plan->ceCollIndex = 0;
++    NCCLCHECKGOTO(ncclCeAllGatherPlan(comm, plan, stream), ret, fail);
++    goto exit;
++  }
+ 
+   // Packing changes only plan ownership and launch amortization. Execute each
+   // member's established local or hierarchical protocol in original queue
+@@ -2457,8 +2635,13 @@ ncclResult_t ncclLaunchCeColl(struct ncclComm* comm, struct ncclKernelPlan* plan
+   }
+ 
+ exit:
++  // Stop in reverse start order so profiler implementations that model nested
++  // host lifetimes never observe a child after its containing fused plan ends.
++  for (int i = fusedProfilerEvents - 1; i >= 0; i--) {
++    ncclProfilerStopCeCollEvent(comm, &plan->ceCollArgs[i], stream);
++  }
+   plan->ceCollIndex = 0;
+-  // Balance the current member's profiler event if its protocol failed.
++  // Balance the current member's profiler event if its unfused protocol failed.
+   if (profilerStarted) ncclProfilerStopCeCollEvent(comm, args, stream);
+   return ret;
+ fail:
