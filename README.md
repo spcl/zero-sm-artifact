@@ -33,3 +33,9 @@ and results to `$WORK/results`.
 ## Figures
 
 Each directory's README lists its run, analysis and figure commands. The figure scripts are in `figures/`.
+
+## License
+
+The scripts, harnesses and analysis code in this repository are released under the MIT license (see `LICENSE`).
+The patch files modify third-party projects (NCCL, Megatron-LM, MSCCL++, TorchComms, VCCL) and are distributed
+under the license of the project they apply to; `NOTICE` lists them.

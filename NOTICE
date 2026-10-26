@@ -1,0 +1,19 @@
+Zero-SM NCCL reproducibility package
+Copyright (c) 2026 SPCL, ETH Zurich and NVIDIA CORPORATION
+
+The original code in this repository is released under the MIT license (LICENSE).
+
+Third-party patches
+
+The following files modify third-party projects. They are derived from, and
+distributed under the license of, the project they apply to, not the MIT
+license above:
+
+  nccl/patches/*.patch                  NVIDIA NCCL (https://github.com/NVIDIA/nccl),
+                                        see its LICENSE.txt
+  e2e/fsdp/patches/megatron-lm/*.patch  Megatron-LM (https://github.com/NVIDIA/Megatron-LM)
+  e2e/pp/megatron/*.patch
+  microbench/alt/mscclpp/mscclpp.patch  MSCCL++ (https://github.com/microsoft/mscclpp)
+  microbench/alt/ncclx/torchcomms.patch TorchComms (https://github.com/meta-pytorch/torchcomms)
+  microbench/alt/vccl/mlx5-lag-weak.patch
+                                        VCCL, see the license of the VCCL repository
